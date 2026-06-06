@@ -1,0 +1,3194 @@
+use crate::ccr::{CcrStore, SqliteStore, HASH_HEX_LEN};
+use crate::compression::{
+    compress_json_request_with_auth, ApiShape, RequestAuthMode, RequestCompression,
+};
+use crate::stats;
+use crate::{error, HrResult};
+use axum::body::{to_bytes, Body};
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::ws::{CloseFrame, Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, UPGRADE};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::Router;
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame as TungsteniteCloseFrame;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+use tracing::{debug, info, trace, warn};
+use url::Url;
+
+pub const DEFAULT_MAX_BODY_BYTES: usize = 25 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Maximum proxy-side `headroom_retrieve` continuation rounds per response,
+/// mirroring the reference handler's `max_retrieval_rounds`.
+const MAX_CCR_CONTINUATION_ROUNDS: usize = 3;
+/// Maximum batch contexts retained for CCR batch-result post-processing.
+const MAX_BATCH_CONTEXTS: usize = 64;
+
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Per-batch CCR context: batch id paired with each request's compressed
+/// params keyed by `custom_id`.
+type BatchContexts = VecDeque<(String, HashMap<String, Value>)>;
+
+#[derive(Debug, Clone)]
+pub struct ProxyConfig {
+    pub listen: SocketAddr,
+    pub openai_upstream: Url,
+    pub anthropic_upstream: Url,
+    pub ccr_db: PathBuf,
+    pub log_level: String,
+    pub max_body_bytes: usize,
+    pub compression_enabled: bool,
+    pub compression_mode: CompressionMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyState {
+    client: reqwest::Client,
+    openai_upstream: Url,
+    anthropic_upstream: Url,
+    store: SqliteStore,
+    max_body_bytes: usize,
+    compression_enabled: bool,
+    compression_mode: CompressionMode,
+    batch_contexts: Arc<Mutex<BatchContexts>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum UpstreamProvider {
+    OpenAi,
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CompressionTarget {
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    AnthropicMessages,
+    AnthropicMessageBatches,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CompressionMode {
+    Ccr,
+    Passthrough,
+    Off,
+}
+
+impl CompressionMode {
+    pub fn parse(value: &str) -> HrResult<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ccr" | "compress" | "compression" | "on" | "auto" => Ok(Self::Ccr),
+            "passthrough" | "pass-through" | "pass" => Ok(Self::Passthrough),
+            "off" | "none" | "disabled" | "false" => Ok(Self::Off),
+            other => Err(error(format!(
+                "unsupported compression mode: {other}; expected ccr, passthrough, or off"
+            ))),
+        }
+    }
+
+    fn allows_compression(self) -> bool {
+        matches!(self, Self::Ccr)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RequestClass {
+    pub provider: UpstreamProvider,
+    pub target: Option<CompressionTarget>,
+    pub skipped_reason: Option<&'static str>,
+}
+
+pub fn build_router(state: ProxyState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz_handler))
+        .route("/healthz/upstream", get(healthz_upstream_handler))
+        .route("/livez", get(livez_handler))
+        .route("/readyz", get(readyz_handler))
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/stats", get(stats_handler))
+        .route("/v1/compress", post(compress_only_handler))
+        .route("/v1/retrieve", post(retrieve_post_handler))
+        .route("/v1/retrieve/stats", get(retrieve_stats_handler))
+        .route("/v1/retrieve/tool_call", post(retrieve_tool_call_handler))
+        .route("/v1/retrieve/{hash}", get(retrieve_get_handler))
+        .route(
+            "/{*path}",
+            get(proxy_get_handler)
+                .post(proxy_http_handler)
+                .put(proxy_http_handler)
+                .patch(proxy_http_handler)
+                .delete(proxy_http_handler)
+                .head(proxy_http_handler)
+                .options(proxy_http_handler),
+        )
+        .fallback(proxy_http_handler)
+        .with_state(state)
+}
+
+pub async fn serve_proxy(config: ProxyConfig) -> HrResult<()> {
+    let store = SqliteStore::open(&config.ccr_db)?;
+    let state = ProxyState::new(
+        config.openai_upstream.clone(),
+        config.anthropic_upstream.clone(),
+        store,
+    )
+    .with_max_body_bytes(config.max_body_bytes)
+    .with_compression_enabled(config.compression_enabled)
+    .with_compression_mode(config.compression_mode);
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+
+    info!(
+        listen = %config.listen,
+        openai_upstream = %config.openai_upstream,
+        anthropic_upstream = %config.anthropic_upstream,
+        ccr_db = %config.ccr_db.display(),
+        max_body_bytes = config.max_body_bytes,
+        compression_enabled = config.compression_enabled,
+        compression_mode = ?config.compression_mode,
+        "proxy startup"
+    );
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+pub fn classify_request(method: &Method, path: &str) -> RequestClass {
+    let provider = if path == "/v1/messages" || path.starts_with("/v1/messages/") {
+        UpstreamProvider::Anthropic
+    } else {
+        UpstreamProvider::OpenAi
+    };
+
+    if method != Method::POST {
+        return RequestClass {
+            provider,
+            target: None,
+            skipped_reason: Some("non_post_method"),
+        };
+    }
+
+    let target = match path {
+        "/v1/chat/completions" => Some(CompressionTarget::OpenAiChatCompletions),
+        "/v1/responses"
+        | "/v1/codex/responses"
+        | "/backend-api/responses"
+        | "/backend-api/codex/responses" => Some(CompressionTarget::OpenAiResponses),
+        "/v1/messages/batches" => Some(CompressionTarget::AnthropicMessageBatches),
+        "/v1/messages" => Some(CompressionTarget::AnthropicMessages),
+        _ => None,
+    };
+
+    RequestClass {
+        provider,
+        target,
+        skipped_reason: skipped_reason_for_path(path, target),
+    }
+}
+
+fn skipped_reason_for_path(path: &str, target: Option<CompressionTarget>) -> Option<&'static str> {
+    if target.is_some() {
+        return None;
+    }
+
+    if path == "/v1/retrieve"
+        || path == "/v1/retrieve/stats"
+        || path == "/v1/retrieve/tool_call"
+        || path.starts_with("/v1/retrieve/")
+        || path == "/v1/compress"
+    {
+        return Some("reserved_proxy_endpoint");
+    }
+
+    if path == "/healthz"
+        || path == "/healthz/upstream"
+        || path == "/livez"
+        || path == "/readyz"
+        || path == "/health"
+        || path == "/metrics"
+        || path == "/stats"
+    {
+        return Some("reserved_proxy_endpoint");
+    }
+
+    if path == "/v1/conversations" || path.starts_with("/v1/conversations/") {
+        return Some("conversations_passthrough");
+    }
+
+    Some("non_target_path")
+}
+
+impl ProxyState {
+    pub fn new(openai_upstream: Url, anthropic_upstream: Url, store: SqliteStore) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(UPSTREAM_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .build()
+            .expect("valid reqwest client configuration");
+        Self {
+            client,
+            openai_upstream,
+            anthropic_upstream,
+            store,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            compression_enabled: true,
+            compression_mode: CompressionMode::Ccr,
+            batch_contexts: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
+    }
+
+    pub fn with_compression_enabled(mut self, compression_enabled: bool) -> Self {
+        self.compression_enabled = compression_enabled;
+        self
+    }
+
+    pub fn with_compression_mode(mut self, compression_mode: CompressionMode) -> Self {
+        self.compression_mode = compression_mode;
+        self
+    }
+
+    pub fn store(&self) -> &SqliteStore {
+        &self.store
+    }
+
+    /// Records per-request compressed params from an Anthropic batch create
+    /// so CCR tool calls in batch results can be continued later.
+    fn record_batch_context(&self, batch_id: &str, compressed_body: &Value) {
+        let Some(requests) = compressed_body.get("requests").and_then(Value::as_array) else {
+            return;
+        };
+        let mut contexts = HashMap::new();
+        for request in requests {
+            let Some(custom_id) = request.get("custom_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(params) = request.get("params") else {
+                continue;
+            };
+            contexts.insert(custom_id.to_string(), params.clone());
+        }
+        if contexts.is_empty() {
+            return;
+        }
+
+        let mut store = self
+            .batch_contexts
+            .lock()
+            .expect("batch context lock poisoned");
+        store.push_back((batch_id.to_string(), contexts));
+        while store.len() > MAX_BATCH_CONTEXTS {
+            store.pop_front();
+        }
+    }
+
+    fn batch_context(&self, batch_id: &str) -> Option<HashMap<String, Value>> {
+        let store = self
+            .batch_contexts
+            .lock()
+            .expect("batch context lock poisoned");
+        store
+            .iter()
+            .rev()
+            .find(|(id, _)| id == batch_id)
+            .map(|(_, contexts)| contexts.clone())
+    }
+}
+
+async fn healthz_handler() -> impl IntoResponse {
+    axum::Json(json!({ "ok": true, "service": "hr-proxy" }))
+}
+
+async fn livez_handler() -> impl IntoResponse {
+    axum::Json(json!({
+        "service": "hr-proxy",
+        "status": "healthy",
+        "alive": true,
+    }))
+}
+
+async fn readyz_handler(State(state): State<ProxyState>) -> Response<Body> {
+    let openai = upstream_health(&state, UpstreamProvider::OpenAi).await;
+    let anthropic = upstream_health(&state, UpstreamProvider::Anthropic).await;
+    let ready = openai.ok && anthropic.ok;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    json_response(
+        status,
+        json!({
+            "service": "hr-proxy",
+            "ready": ready,
+            "openai": openai,
+            "anthropic": anthropic,
+        }),
+    )
+}
+
+async fn health_handler(State(state): State<ProxyState>) -> Response<Body> {
+    let ccr_entry_count = state.store.count().unwrap_or_default();
+    let snapshot = stats::stats_with_ccr_entry_count(ccr_entry_count);
+    json_response(
+        StatusCode::OK,
+        json!({
+            "service": "hr-proxy",
+            "status": "healthy",
+            "ready": true,
+            "stats": snapshot,
+        }),
+    )
+}
+
+async fn healthz_upstream_handler(State(state): State<ProxyState>) -> Response<Body> {
+    let openai = upstream_health(&state, UpstreamProvider::OpenAi).await;
+    let anthropic = upstream_health(&state, UpstreamProvider::Anthropic).await;
+    let ok = openai.ok && anthropic.ok;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    json_response(
+        status,
+        json!({
+            "ok": ok,
+            "openai": openai,
+            "anthropic": anthropic,
+        }),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct UpstreamHealth {
+    ok: bool,
+    status: Option<u16>,
+    error: Option<String>,
+}
+
+async fn upstream_health(state: &ProxyState, provider: UpstreamProvider) -> UpstreamHealth {
+    let mut url = match provider {
+        UpstreamProvider::OpenAi => state.openai_upstream.clone(),
+        UpstreamProvider::Anthropic => state.anthropic_upstream.clone(),
+    };
+    url.set_path("/healthz");
+    url.set_query(None);
+
+    match state.client.get(url).send().await {
+        Ok(response) => UpstreamHealth {
+            ok: response.status().is_success(),
+            status: Some(response.status().as_u16()),
+            error: None,
+        },
+        Err(err) => UpstreamHealth {
+            ok: false,
+            status: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
+    let ccr_entry_count = state.store.count().unwrap_or_default();
+    let snapshot = stats::stats_with_ccr_entry_count(ccr_entry_count);
+    let skipped_total: u64 = snapshot.skipped_requests.values().sum();
+    let body = format!(
+        "\
+# TYPE hr_total_requests counter
+hr_total_requests {}
+# TYPE hr_compressed_requests counter
+hr_compressed_requests {}
+# TYPE hr_skipped_requests counter
+hr_skipped_requests {}
+# TYPE hr_bytes_before counter
+hr_bytes_before {}
+# TYPE hr_bytes_after counter
+hr_bytes_after {}
+# TYPE hr_tokens_before counter
+hr_tokens_before {}
+# TYPE hr_tokens_after counter
+hr_tokens_after {}
+# TYPE hr_ccr_entry_count gauge
+hr_ccr_entry_count {}
+# TYPE hr_decompress_hits counter
+hr_decompress_hits {}
+# TYPE hr_decompress_misses counter
+hr_decompress_misses {}
+# TYPE hr_websocket_sessions counter
+hr_websocket_sessions {}
+# TYPE hr_sse_streams counter
+hr_sse_streams {}
+# TYPE hr_sse_input_tokens counter
+hr_sse_input_tokens {}
+# TYPE hr_sse_output_tokens counter
+hr_sse_output_tokens {}
+# TYPE hr_sse_cache_read_input_tokens counter
+hr_sse_cache_read_input_tokens {}
+# TYPE hr_sse_cache_creation_input_tokens counter
+hr_sse_cache_creation_input_tokens {}
+# TYPE hr_ccr_continuation_rounds counter
+hr_ccr_continuation_rounds {}
+# TYPE hr_ccr_continuation_retrievals counter
+hr_ccr_continuation_retrievals {}
+# TYPE hr_ccr_stream_tool_calls counter
+hr_ccr_stream_tool_calls {}
+# TYPE hr_ccr_batch_results_processed counter
+hr_ccr_batch_results_processed {}
+",
+        snapshot.total_requests,
+        snapshot.compressed_requests,
+        skipped_total,
+        snapshot.bytes_before,
+        snapshot.bytes_after,
+        snapshot.tokens_before,
+        snapshot.tokens_after,
+        snapshot.ccr_entry_count,
+        snapshot.decompress_hits,
+        snapshot.decompress_misses,
+        snapshot.websocket_sessions,
+        snapshot.sse_streams,
+        snapshot.sse_input_tokens,
+        snapshot.sse_output_tokens,
+        snapshot.sse_cache_read_input_tokens,
+        snapshot.sse_cache_creation_input_tokens,
+        snapshot.ccr_continuation_rounds,
+        snapshot.ccr_continuation_retrievals,
+        snapshot.ccr_stream_tool_calls,
+        snapshot.ccr_batch_results_processed,
+    );
+    let skipped_by_reason = snapshot
+        .skipped_requests
+        .iter()
+        .map(|(reason, count)| {
+            format!("hr_skipped_requests_by_reason{{reason=\"{reason}\"}} {count}\n")
+        })
+        .collect::<String>();
+    let cache_hit_rates = snapshot
+        .sse_cache_hit_rates
+        .iter()
+        .map(|(provider, stats)| {
+            format!(
+                "# TYPE proxy_cache_hit_rate_per_session summary\n\
+proxy_cache_hit_rate_per_session_count{{provider=\"{provider}\"}} {}\n\
+proxy_cache_hit_rate_per_session_sum{{provider=\"{provider}\"}} {}\n",
+                stats.count, stats.sum
+            )
+        })
+        .collect::<String>();
+    let body = format!("{body}{skipped_by_reason}{cache_hit_rates}");
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .unwrap_or_else(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+async fn stats_handler(State(state): State<ProxyState>) -> impl IntoResponse {
+    let ccr_entry_count = state.store.count().unwrap_or_default();
+    let snapshot = stats::stats_with_ccr_entry_count(ccr_entry_count);
+    info!(
+        total_requests = snapshot.total_requests,
+        compressed_requests = snapshot.compressed_requests,
+        ccr_entry_count = snapshot.ccr_entry_count,
+        savings_ratio = snapshot.savings_ratio,
+        websocket_sessions = snapshot.websocket_sessions,
+        "stats summary"
+    );
+    axum::Json(snapshot)
+}
+
+#[derive(Debug, Deserialize)]
+struct RetrieveRequest {
+    hash: String,
+    query: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetrieveQuery {
+    query: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RetrieveSearchResult {
+    line: usize,
+    text: String,
+}
+
+async fn retrieve_post_handler(
+    State(state): State<ProxyState>,
+    axum::Json(request): axum::Json<RetrieveRequest>,
+) -> Response<Body> {
+    retrieve_response(&state.store, &request.hash, request.query.as_deref())
+}
+
+async fn retrieve_get_handler(
+    State(state): State<ProxyState>,
+    Path(hash): Path<String>,
+    Query(query): Query<RetrieveQuery>,
+) -> Response<Body> {
+    retrieve_response(&state.store, &hash, query.query.as_deref())
+}
+
+async fn retrieve_stats_handler(State(state): State<ProxyState>) -> Response<Body> {
+    let snapshot = stats::stats_with_ccr_entry_count(state.store.count().unwrap_or_default());
+    json_response(
+        StatusCode::OK,
+        json!({
+            "store": {
+                "entries": snapshot.ccr_entry_count,
+                "decompress_hits": snapshot.decompress_hits,
+                "decompress_misses": snapshot.decompress_misses,
+            },
+            "recent_retrievals": [],
+        }),
+    )
+}
+
+async fn retrieve_tool_call_handler(
+    State(state): State<ProxyState>,
+    axum::Json(request): axum::Json<serde_json::Value>,
+) -> Response<Body> {
+    let provider = request
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("anthropic");
+    let Some(tool_call) = request.get("tool_call") else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"success": false, "error": "tool_call required"}),
+        );
+    };
+
+    let Some(parsed) = parse_retrieve_tool_call(tool_call, provider) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "success": false,
+                "error": "invalid tool call or not a headroom_retrieve call"
+            }),
+        );
+    };
+
+    let data = retrieve_value(&state.store, &parsed.hash, parsed.query.as_deref());
+    let success = data.get("error").is_none();
+    let tool_result = format_tool_result(tool_call, provider, &data);
+
+    json_response(
+        StatusCode::OK,
+        json!({
+            "success": success,
+            "tool_result": tool_result,
+            "data": data,
+        }),
+    )
+}
+
+async fn compress_only_handler(
+    State(state): State<ProxyState>,
+    req: Request<Body>,
+) -> Response<Body> {
+    stats::record_request();
+
+    let headers = req.headers().clone();
+    let body = match read_limited_body(req, state.max_body_bytes).await {
+        Ok(body) => body,
+        Err(err) if err.to_string().contains("payload_too_large") => {
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE, err.to_string());
+        }
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": {
+                    "type": "invalid_request",
+                    "message": "Invalid JSON in request body."
+                }
+            }),
+        );
+    };
+
+    if compression_bypass_requested(&headers) {
+        stats::record_skipped_request("bypass_header");
+        return json_response(
+            StatusCode::OK,
+            json!({
+                "messages": value.get("messages").cloned().unwrap_or_else(|| json!([])),
+                "tokens_before": 0,
+                "tokens_after": 0,
+                "tokens_saved": 0,
+                "compression_ratio": 1.0,
+                "transforms_applied": [],
+                "ccr_hashes": [],
+                "skipped_reason": "bypass_header",
+            }),
+        );
+    }
+
+    if value.get("messages").is_none() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": {
+                    "type": "invalid_request",
+                    "message": "Missing required field: messages"
+                }
+            }),
+        );
+    }
+
+    if value.get("model").is_none() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": {
+                    "type": "invalid_request",
+                    "message": "Missing required field: model"
+                }
+            }),
+        );
+    }
+
+    let mutation = compress_json_request_with_auth(
+        &body,
+        ApiShape::OpenAiChatCompletions,
+        &state.store,
+        classify_auth_mode(&headers),
+    );
+    record_mutation_stats(&mutation);
+    let mutated = serde_json::from_slice::<serde_json::Value>(&mutation.body).unwrap_or(value);
+    let tokens_saved = mutation.tokens_before.saturating_sub(mutation.tokens_after);
+    let compression_ratio = if mutation.tokens_before == 0 {
+        1.0
+    } else {
+        mutation.tokens_after as f64 / mutation.tokens_before as f64
+    };
+
+    let mut response = json!({
+        "messages": mutated.get("messages").cloned().unwrap_or_else(|| json!([])),
+        "tokens_before": mutation.tokens_before,
+        "tokens_after": mutation.tokens_after,
+        "tokens_saved": tokens_saved,
+        "compression_ratio": compression_ratio,
+        "transforms_applied": if mutation.compressed { vec!["ccr_live_zone"] } else { Vec::<&str>::new() },
+        "ccr_hashes": mutation.hashes,
+    });
+
+    if let Some(reason) = mutation.skipped_reason {
+        response["skipped_reason"] = json!(reason);
+    }
+    if let Some(tools) = mutated.get("tools") {
+        response["tools"] = tools.clone();
+    }
+
+    json_response(StatusCode::OK, response)
+}
+
+#[derive(Debug)]
+struct ParsedToolCall {
+    hash: String,
+    query: Option<String>,
+}
+
+fn parse_retrieve_tool_call(
+    tool_call: &serde_json::Value,
+    provider: &str,
+) -> Option<ParsedToolCall> {
+    if provider.eq_ignore_ascii_case("openai") {
+        let function = tool_call.get("function")?;
+        let name = function.get("name").and_then(serde_json::Value::as_str)?;
+        if !is_retrieve_tool_name(name) {
+            return None;
+        }
+        let arguments = function
+            .get("arguments")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("{}");
+        let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        parse_retrieve_arguments(&arguments)
+    } else {
+        let name = tool_call
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !is_retrieve_tool_name(name) {
+            return None;
+        }
+        let input = tool_call.get("input")?;
+        parse_retrieve_arguments(input)
+    }
+}
+
+fn is_retrieve_tool_name(name: &str) -> bool {
+    name == "headroom_retrieve" || name.ends_with("__headroom_retrieve")
+}
+
+fn parse_retrieve_arguments(arguments: &serde_json::Value) -> Option<ParsedToolCall> {
+    let hash = arguments
+        .get("hash")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let query = arguments
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    Some(ParsedToolCall { hash, query })
+}
+
+fn format_tool_result(
+    tool_call: &serde_json::Value,
+    provider: &str,
+    data: &serde_json::Value,
+) -> serde_json::Value {
+    let content = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+    if provider.eq_ignore_ascii_case("openai") {
+        json!({
+            "role": "tool",
+            "tool_call_id": tool_call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            "content": content,
+        })
+    } else {
+        json!({
+            "type": "tool_result",
+            "tool_use_id": tool_call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            "content": content,
+        })
+    }
+}
+
+fn retrieve_response(store: &SqliteStore, hash: &str, query: Option<&str>) -> Response<Body> {
+    let value = retrieve_value(store, hash, query);
+    let status = if value.get("error").is_some() {
+        if !valid_hash(hash) {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    } else {
+        StatusCode::OK
+    };
+    json_response(status, value)
+}
+
+fn retrieve_value(store: &SqliteStore, hash: &str, query: Option<&str>) -> serde_json::Value {
+    if !valid_hash(hash) {
+        return json!({
+            "hash": hash,
+            "error": format!("invalid hash format; expected {HASH_HEX_LEN} hex characters"),
+        });
+    }
+
+    let Some(original) = crate::decompress_hash(hash, store) else {
+        return json!({
+            "hash": hash,
+            "error": "entry not found",
+        });
+    };
+
+    if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
+        let results = search_content(&original, query);
+        json!({
+            "hash": hash,
+            "query": query,
+            "results": results,
+            "count": results.len(),
+        })
+    } else {
+        json!({
+            "hash": hash,
+            "original_content": original,
+            "original_tokens": crate::estimate_tokens(&original),
+            "original_item_count": 1,
+            "compressed_item_count": 1,
+            "tool_name": "headroom_retrieve",
+            "retrieval_count": 1,
+        })
+    }
+}
+
+fn search_content(content: &str, query: &str) -> Vec<RetrieveSearchResult> {
+    let query = query.to_lowercase();
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.to_lowercase().contains(&query))
+        .map(|(index, line)| RetrieveSearchResult {
+            line: index + 1,
+            text: line.to_string(),
+        })
+        .collect()
+}
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == HASH_HEX_LEN && hash.chars().all(|char| char.is_ascii_hexdigit())
+}
+
+async fn proxy_get_handler(
+    State(state): State<ProxyState>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    req: Request<Body>,
+) -> Response<Body> {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let path = uri.path().to_string();
+    let class = classify_request(&method, &path);
+
+    debug!(
+        method = %method,
+        path,
+        provider = ?class.provider,
+        target = ?class.target,
+        skipped_reason = ?class.skipped_reason,
+        "request classification"
+    );
+
+    if let Ok(upgrade) = ws {
+        stats::record_request();
+        let headers = req.headers().clone();
+        return upgrade
+            .on_upgrade(move |socket| {
+                proxy_websocket(
+                    socket,
+                    state,
+                    uri,
+                    headers,
+                    class.provider,
+                    Some(client_addr),
+                )
+            })
+            .into_response();
+    }
+
+    proxy_http(state, req, class, Some(client_addr)).await
+}
+
+async fn proxy_http_handler(
+    State(state): State<ProxyState>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response<Body> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let class = classify_request(&method, &path);
+
+    debug!(
+        method = %method,
+        path,
+        provider = ?class.provider,
+        target = ?class.target,
+        skipped_reason = ?class.skipped_reason,
+        "request classification"
+    );
+
+    proxy_http(state, req, class, Some(client_addr)).await
+}
+
+async fn proxy_http(
+    state: ProxyState,
+    req: Request<Body>,
+    class: RequestClass,
+    client_addr: Option<SocketAddr>,
+) -> Response<Body> {
+    stats::record_request();
+
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+    let upstream_url = match upstream_url(&state, class.provider, &uri) {
+        Ok(url) => url,
+        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    };
+
+    if let Some(target) = class.target {
+        if !state.compression_enabled || !state.compression_mode.allows_compression() {
+            stats::record_skipped_request("compression_disabled");
+            return match forward_streaming(
+                state,
+                method,
+                headers,
+                req.into_body(),
+                upstream_url,
+                client_addr,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => upstream_error_response(err),
+            };
+        }
+
+        if compression_bypass_requested(&headers) {
+            stats::record_skipped_request("bypass_header");
+            return match forward_streaming(
+                state,
+                method,
+                headers,
+                req.into_body(),
+                upstream_url,
+                client_addr,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => upstream_error_response(err),
+            };
+        }
+
+        if !is_application_json(&headers) {
+            stats::record_skipped_request("non_json_content_type");
+            return match forward_streaming(
+                state,
+                method,
+                headers,
+                req.into_body(),
+                upstream_url,
+                client_addr,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => upstream_error_response(err),
+            };
+        }
+
+        match buffer_and_forward_known_json(state, req, target, upstream_url, client_addr).await {
+            Ok(response) => response,
+            Err(err) if err.to_string().contains("payload_too_large") => {
+                error_response(StatusCode::PAYLOAD_TOO_LARGE, err.to_string())
+            }
+            Err(err) => upstream_error_response(err),
+        }
+    } else {
+        if let Some(reason) = class.skipped_reason {
+            stats::record_skipped_request(reason);
+        }
+
+        if let Some(batch_id) = anthropic_batch_results_batch_id(&method, uri.path()) {
+            if let Some(contexts) = state.batch_context(&batch_id) {
+                return match forward_batch_results(
+                    state,
+                    headers,
+                    upstream_url,
+                    client_addr,
+                    contexts,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(err) => upstream_error_response(err),
+                };
+            }
+        }
+
+        match forward_streaming(
+            state,
+            method,
+            headers,
+            req.into_body(),
+            upstream_url,
+            client_addr,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => upstream_error_response(err),
+        }
+    }
+}
+
+async fn buffer_and_forward_known_json(
+    state: ProxyState,
+    req: Request<Body>,
+    target: CompressionTarget,
+    upstream_url: Url,
+    client_addr: Option<SocketAddr>,
+) -> HrResult<Response<Body>> {
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let body = read_limited_body(req, state.max_body_bytes).await?;
+
+    let shape = match target {
+        CompressionTarget::OpenAiChatCompletions => ApiShape::OpenAiChatCompletions,
+        CompressionTarget::OpenAiResponses => ApiShape::OpenAiResponses,
+        CompressionTarget::AnthropicMessages => ApiShape::AnthropicMessages,
+        CompressionTarget::AnthropicMessageBatches => ApiShape::AnthropicMessageBatches,
+    };
+    let mut mutation =
+        compress_json_request_with_auth(&body, shape, &state.store, classify_auth_mode(&headers));
+    record_mutation_stats(&mutation);
+    let body_to_forward = std::mem::take(&mut mutation.body);
+
+    let mut response = match target {
+        CompressionTarget::AnthropicMessages => {
+            forward_with_ccr_continuation(
+                &state,
+                method,
+                &headers,
+                body_to_forward,
+                upstream_url,
+                client_addr,
+                CcrProvider::Anthropic,
+            )
+            .await?
+        }
+        CompressionTarget::OpenAiChatCompletions => {
+            forward_with_ccr_continuation(
+                &state,
+                method,
+                &headers,
+                body_to_forward,
+                upstream_url,
+                client_addr,
+                CcrProvider::OpenAi,
+            )
+            .await?
+        }
+        CompressionTarget::AnthropicMessageBatches => {
+            forward_batch_create(
+                &state,
+                method,
+                &headers,
+                body_to_forward,
+                upstream_url,
+                client_addr,
+            )
+            .await?
+        }
+        CompressionTarget::OpenAiResponses => {
+            forward_buffered(
+                state,
+                method,
+                headers,
+                body_to_forward,
+                upstream_url,
+                client_addr,
+            )
+            .await?
+        }
+    };
+    apply_compression_response_headers(response.headers_mut(), &mutation);
+    Ok(response)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcrProvider {
+    Anthropic,
+    OpenAi,
+}
+
+impl CcrProvider {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+        }
+    }
+}
+
+/// Forwards a compressed target request and, when the upstream JSON response
+/// contains `headroom_retrieve` tool calls, resolves them from the CCR store
+/// and continues the conversation upstream until the response has no CCR tool
+/// calls left (or the round limit is hit). Mirrors the reference proxy's
+/// non-streaming CCR response handling.
+async fn forward_with_ccr_continuation(
+    state: &ProxyState,
+    method: Method,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+    upstream_url: Url,
+    client_addr: Option<SocketAddr>,
+    provider: CcrProvider,
+) -> HrResult<Response<Body>> {
+    let request_id = ensure_request_id(headers);
+    let request_body: Option<Value> = serde_json::from_slice(&body).ok();
+    let mut builder = state
+        .client
+        .request(method, upstream_url.clone())
+        .body(body);
+    builder = apply_headers(builder, headers, client_addr, &request_id);
+    let response = builder.send().await?;
+    info!(
+        upstream = %upstream_url,
+        status = %response.status(),
+        "request forwarded"
+    );
+
+    let Some(request_body) = request_body else {
+        return response_to_axum(response, &request_id, upstream_url.path());
+    };
+    if !ccr_response_buffer_eligible(&response) {
+        return response_to_axum(response, &request_id, upstream_url.path());
+    }
+
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let bytes = response.bytes().await?;
+    let Ok(initial) = serde_json::from_slice::<Value>(&bytes) else {
+        return buffered_response_to_axum(
+            status,
+            &response_headers,
+            bytes.to_vec(),
+            &request_id,
+            false,
+        );
+    };
+    if extract_ccr_tool_calls(&initial, provider).is_empty() {
+        return buffered_response_to_axum(
+            status,
+            &response_headers,
+            bytes.to_vec(),
+            &request_id,
+            false,
+        );
+    }
+
+    let (final_response, progressed) = run_ccr_continuation(
+        state,
+        &request_body,
+        initial,
+        &upstream_url,
+        headers,
+        client_addr,
+        provider,
+    )
+    .await;
+    if !progressed {
+        // No continuation round succeeded — return the upstream bytes
+        // untouched so the client can resolve the tool call itself.
+        return buffered_response_to_axum(
+            status,
+            &response_headers,
+            bytes.to_vec(),
+            &request_id,
+            false,
+        );
+    }
+    let body = serde_json::to_vec(&final_response)?;
+    buffered_response_to_axum(status, &response_headers, body, &request_id, true)
+}
+
+/// Whether the upstream response can be buffered for CCR tool call handling:
+/// a successful, identity-encoded JSON body (SSE and encoded bodies stay on
+/// the streaming passthrough path).
+fn ccr_response_buffer_eligible(response: &reqwest::Response) -> bool {
+    response.status() == StatusCode::OK
+        && response.headers().get("content-encoding").is_none()
+        && is_application_json(response.headers())
+}
+
+/// Runs the CCR continuation loop. Returns the latest upstream response and
+/// whether at least one continuation round completed successfully.
+async fn run_ccr_continuation(
+    state: &ProxyState,
+    request_body: &Value,
+    initial: Value,
+    upstream_url: &Url,
+    headers: &HeaderMap,
+    client_addr: Option<SocketAddr>,
+    provider: CcrProvider,
+) -> (Value, bool) {
+    let mut messages = request_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut current = initial;
+    let mut progressed = false;
+    let mut rounds = 0;
+
+    while rounds < MAX_CCR_CONTINUATION_ROUNDS {
+        let ccr_calls = extract_ccr_tool_calls(&current, provider);
+        if ccr_calls.is_empty() {
+            break;
+        }
+        rounds += 1;
+        stats::record_ccr_continuation_retrievals(ccr_calls.len() as u64);
+        info!(
+            count = ccr_calls.len(),
+            round = rounds,
+            provider = provider.as_str(),
+            "ccr continuation: resolving retrieval tool calls"
+        );
+
+        messages.push(extract_assistant_message(&current, provider));
+        match provider {
+            CcrProvider::Anthropic => {
+                let blocks = ccr_calls
+                    .iter()
+                    .map(|(tool_call, parsed)| {
+                        let data =
+                            retrieve_value(&state.store, &parsed.hash, parsed.query.as_deref());
+                        format_tool_result(tool_call, provider.as_str(), &data)
+                    })
+                    .collect::<Vec<_>>();
+                messages.push(json!({"role": "user", "content": blocks}));
+            }
+            CcrProvider::OpenAi => {
+                for (tool_call, parsed) in &ccr_calls {
+                    let data = retrieve_value(&state.store, &parsed.hash, parsed.query.as_deref());
+                    messages.push(format_tool_result(tool_call, provider.as_str(), &data));
+                }
+            }
+        }
+
+        let mut continuation_body = request_body.clone();
+        continuation_body["messages"] = Value::Array(messages.clone());
+
+        match send_ccr_continuation(
+            state,
+            &continuation_body,
+            upstream_url,
+            headers,
+            client_addr,
+        )
+        .await
+        {
+            Ok(next) => {
+                stats::record_ccr_continuation_round();
+                progressed = true;
+                current = next;
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "ccr continuation request failed; returning previous response"
+                );
+                break;
+            }
+        }
+    }
+
+    if rounds >= MAX_CCR_CONTINUATION_ROUNDS
+        && !extract_ccr_tool_calls(&current, provider).is_empty()
+    {
+        warn!("ccr continuation hit max rounds with unresolved retrieval tool calls");
+    }
+    (current, progressed)
+}
+
+async fn send_ccr_continuation(
+    state: &ProxyState,
+    body: &Value,
+    upstream_url: &Url,
+    headers: &HeaderMap,
+    client_addr: Option<SocketAddr>,
+) -> HrResult<Value> {
+    let request_id = generate_request_id();
+    let payload = serde_json::to_vec(body)?;
+    let mut sanitized = headers.clone();
+    for name in ["content-encoding", "accept-encoding"] {
+        sanitized.remove(name);
+    }
+    sanitized.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    let mut builder = state
+        .client
+        .request(Method::POST, upstream_url.clone())
+        .body(payload);
+    builder = apply_headers(builder, &sanitized, client_addr, &request_id);
+    let response = builder.send().await?;
+    let status = response.status();
+    if status != StatusCode::OK {
+        return Err(error(format!(
+            "ccr continuation upstream returned status {status}"
+        )));
+    }
+    let bytes = response.bytes().await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Extracts `headroom_retrieve` tool calls from a provider-shaped response.
+fn extract_ccr_tool_calls(response: &Value, provider: CcrProvider) -> Vec<(Value, ParsedToolCall)> {
+    let tool_calls: Vec<&Value> = match provider {
+        CcrProvider::Anthropic => response
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        CcrProvider::OpenAi => response
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("tool_calls"))
+            .and_then(Value::as_array)
+            .map(|calls| calls.iter().collect())
+            .unwrap_or_default(),
+    };
+
+    tool_calls
+        .into_iter()
+        .filter_map(|tool_call| {
+            parse_retrieve_tool_call(tool_call, provider.as_str())
+                .map(|parsed| (tool_call.clone(), parsed))
+        })
+        .collect()
+}
+
+/// Rebuilds the assistant turn from a provider response for continuation.
+fn extract_assistant_message(response: &Value, provider: CcrProvider) -> Value {
+    match provider {
+        CcrProvider::Anthropic => json!({
+            "role": "assistant",
+            "content": response.get("content").cloned().unwrap_or_else(|| json!([])),
+        }),
+        CcrProvider::OpenAi => {
+            let message = response
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let mut assistant = json!({
+                "role": "assistant",
+                "content": message.get("content").cloned().unwrap_or(Value::Null),
+            });
+            if let Some(tool_calls) = message.get("tool_calls") {
+                assistant["tool_calls"] = tool_calls.clone();
+            }
+            assistant
+        }
+    }
+}
+
+/// Forwards an Anthropic batch create and records per-request context from
+/// the compressed body so CCR tool calls in batch results can be continued.
+async fn forward_batch_create(
+    state: &ProxyState,
+    method: Method,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+    upstream_url: Url,
+    client_addr: Option<SocketAddr>,
+) -> HrResult<Response<Body>> {
+    let request_id = ensure_request_id(headers);
+    let compressed_body: Option<Value> = serde_json::from_slice(&body).ok();
+    let mut builder = state
+        .client
+        .request(method, upstream_url.clone())
+        .body(body);
+    builder = apply_headers(builder, headers, client_addr, &request_id);
+    let response = builder.send().await?;
+    info!(
+        upstream = %upstream_url,
+        status = %response.status(),
+        "request forwarded"
+    );
+
+    if !ccr_response_buffer_eligible(&response) {
+        return response_to_axum(response, &request_id, upstream_url.path());
+    }
+
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let bytes = response.bytes().await?;
+    if let (Some(compressed_body), Ok(response_json)) =
+        (compressed_body, serde_json::from_slice::<Value>(&bytes))
+    {
+        if let Some(batch_id) = response_json.get("id").and_then(Value::as_str) {
+            state.record_batch_context(batch_id, &compressed_body);
+        }
+    }
+    buffered_response_to_axum(
+        status,
+        &response_headers,
+        bytes.to_vec(),
+        &request_id,
+        false,
+    )
+}
+
+fn anthropic_batch_results_batch_id(method: &Method, path: &str) -> Option<String> {
+    if method != Method::GET {
+        return None;
+    }
+    let rest = path.strip_prefix("/v1/messages/batches/")?;
+    let (batch_id, tail) = rest.split_once('/')?;
+    if tail != "results" || batch_id.is_empty() {
+        return None;
+    }
+    Some(batch_id.to_string())
+}
+
+/// Fetches Anthropic batch results and post-processes each JSONL line whose
+/// message contains `headroom_retrieve` tool calls, continuing those requests
+/// against `/v1/messages` with the stored batch context.
+async fn forward_batch_results(
+    state: ProxyState,
+    headers: HeaderMap,
+    upstream_url: Url,
+    client_addr: Option<SocketAddr>,
+    contexts: HashMap<String, Value>,
+) -> HrResult<Response<Body>> {
+    let request_id = ensure_request_id(&headers);
+    let mut builder = state.client.request(Method::GET, upstream_url.clone());
+    builder = apply_headers(builder, &headers, client_addr, &request_id);
+    let response = builder.send().await?;
+    info!(
+        upstream = %upstream_url,
+        status = %response.status(),
+        "request forwarded"
+    );
+
+    if response.status() != StatusCode::OK || response.headers().get("content-encoding").is_some() {
+        return response_to_axum(response, &request_id, upstream_url.path());
+    }
+
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let bytes = response.bytes().await?;
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return buffered_response_to_axum(
+            status,
+            &response_headers,
+            bytes.to_vec(),
+            &request_id,
+            false,
+        );
+    };
+
+    let mut messages_url = state.anthropic_upstream.clone();
+    messages_url.set_path("/v1/messages");
+
+    let mut processed_any = false;
+    let mut lines_out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(mut result) = serde_json::from_str::<Value>(line) else {
+            lines_out.push(line.to_string());
+            continue;
+        };
+        let custom_id = result
+            .get("custom_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let message = result
+            .get("result")
+            .and_then(|inner| inner.get("message"))
+            .cloned();
+        let (Some(custom_id), Some(message)) = (custom_id, message) else {
+            lines_out.push(line.to_string());
+            continue;
+        };
+        let Some(params) = contexts.get(&custom_id) else {
+            lines_out.push(line.to_string());
+            continue;
+        };
+        if extract_ccr_tool_calls(&message, CcrProvider::Anthropic).is_empty() {
+            lines_out.push(line.to_string());
+            continue;
+        }
+
+        let (final_message, progressed) = run_ccr_continuation(
+            &state,
+            params,
+            message,
+            &messages_url,
+            &headers,
+            client_addr,
+            CcrProvider::Anthropic,
+        )
+        .await;
+        if progressed {
+            result["result"]["message"] = final_message;
+            stats::record_ccr_batch_result_processed();
+            processed_any = true;
+            info!(custom_id, "ccr batch result continuation complete");
+            lines_out.push(serde_json::to_string(&result)?);
+        } else {
+            lines_out.push(line.to_string());
+        }
+    }
+
+    if !processed_any {
+        return buffered_response_to_axum(
+            status,
+            &response_headers,
+            bytes.to_vec(),
+            &request_id,
+            false,
+        );
+    }
+    let mut body = lines_out.join("\n");
+    body.push('\n');
+    buffered_response_to_axum(
+        status,
+        &response_headers,
+        body.into_bytes(),
+        &request_id,
+        true,
+    )
+}
+
+/// Builds a client response from buffered upstream bytes, mirroring
+/// `response_to_axum` header filtering. When the body was replaced, stale
+/// content-length/content-encoding headers are dropped.
+fn buffered_response_to_axum(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+    request_id: &str,
+    body_replaced: bool,
+) -> HrResult<Response<Body>> {
+    let upstream_request_id = upstream_request_id(headers);
+    let mut builder = Response::builder().status(status);
+    let connection_listed = connection_listed_headers(headers);
+
+    for (name, value) in headers {
+        if is_response_drop_header(name) {
+            continue;
+        }
+        if connection_listed
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(name.as_str()))
+        {
+            continue;
+        }
+        if body_replaced
+            && (name == CONTENT_LENGTH || name.as_str().eq_ignore_ascii_case("content-encoding"))
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+
+    let mut response = builder.body(Body::from(body))?;
+    insert_header(response.headers_mut(), "x-request-id", request_id);
+    if let Some(upstream_request_id) = upstream_request_id.as_deref() {
+        insert_header(
+            response.headers_mut(),
+            "headroom-upstream-request-id",
+            upstream_request_id,
+        );
+    }
+    Ok(response)
+}
+
+async fn read_limited_body(req: Request<Body>, max_body_bytes: usize) -> HrResult<Vec<u8>> {
+    let headers = req.headers();
+    if let Some(content_length) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        if content_length > max_body_bytes {
+            return Err(error(format!(
+                "payload_too_large: Content-Length {content_length} exceeds compression buffer limit {max_body_bytes}"
+            )));
+        }
+    }
+
+    let body = to_bytes(req.into_body(), max_body_bytes)
+        .await
+        .map_err(|err| {
+            error(format!(
+                "payload_too_large: request body exceeds compression buffer limit {max_body_bytes}: {err}",
+            ))
+        })?;
+    Ok(body.to_vec())
+}
+
+fn record_mutation_stats(mutation: &RequestCompression) {
+    if mutation.compressed {
+        debug!(
+            bytes_before = mutation.bytes_before,
+            bytes_after = mutation.bytes_after,
+            tokens_before = mutation.tokens_before,
+            tokens_after = mutation.tokens_after,
+            "compression byte token counts"
+        );
+        stats::record_compressed_request(
+            mutation.bytes_before as u64,
+            mutation.bytes_after as u64,
+            mutation.tokens_before as u64,
+            mutation.tokens_after as u64,
+        );
+        info!(
+            hashes = ?mutation.hashes,
+            bytes_before = mutation.bytes_before,
+            bytes_after = mutation.bytes_after,
+            tokens_before = mutation.tokens_before,
+            tokens_after = mutation.tokens_after,
+            "compression decision"
+        );
+    } else if let Some(reason) = &mutation.skipped_reason {
+        stats::record_skipped_request(reason);
+        info!(reason, "compression skipped");
+    }
+}
+
+async fn forward_buffered(
+    state: ProxyState,
+    method: Method,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    upstream_url: Url,
+    client_addr: Option<SocketAddr>,
+) -> HrResult<Response<Body>> {
+    let request_id = ensure_request_id(&headers);
+    let mut builder = state
+        .client
+        .request(method, upstream_url.clone())
+        .body(body);
+    builder = apply_headers(builder, &headers, client_addr, &request_id);
+    let response = builder.send().await?;
+    info!(
+        upstream = %upstream_url,
+        status = %response.status(),
+        "request forwarded"
+    );
+    response_to_axum(response, &request_id, upstream_url.path())
+}
+
+async fn forward_streaming(
+    state: ProxyState,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+    upstream_url: Url,
+    client_addr: Option<SocketAddr>,
+) -> HrResult<Response<Body>> {
+    let request_id = ensure_request_id(&headers);
+    let stream = body.into_data_stream();
+    let mut builder = state
+        .client
+        .request(method, upstream_url.clone())
+        .body(reqwest::Body::wrap_stream(stream));
+    builder = apply_headers(builder, &headers, client_addr, &request_id);
+    let response = builder.send().await?;
+    info!(
+        upstream = %upstream_url,
+        status = %response.status(),
+        "request forwarded"
+    );
+    response_to_axum(response, &request_id, upstream_url.path())
+}
+
+fn apply_headers(
+    mut builder: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    client_addr: Option<SocketAddr>,
+    request_id: &str,
+) -> reqwest::RequestBuilder {
+    builder = builder.header("x-request-id", request_id);
+    builder = builder.header("x-forwarded-proto", "http");
+    if let Some(host) = headers.get(HOST) {
+        builder = builder.header("x-forwarded-host", host);
+    }
+    if let Some(xff) = forwarded_for(headers, client_addr) {
+        builder = builder.header("x-forwarded-for", xff);
+    }
+    if let Some(account_id) = chatgpt_account_id_from_authorization(headers) {
+        builder = builder.header("ChatGPT-Account-ID", account_id);
+    }
+
+    let connection_listed = connection_listed_headers(headers);
+    for (name, value) in headers {
+        if is_request_drop_header(name) {
+            continue;
+        }
+        if connection_listed
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(name.as_str()))
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
+fn response_to_axum(
+    response: reqwest::Response,
+    request_id: &str,
+    request_path: &str,
+) -> HrResult<Response<Body>> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let upstream_request_id = upstream_request_id(&headers);
+    let sse_kind = sse_stream_kind(&headers, request_path);
+    let mut builder = Response::builder().status(status);
+    let connection_listed = connection_listed_headers(&headers);
+
+    for (name, value) in headers {
+        let Some(name) = name else {
+            continue;
+        };
+        if is_response_drop_header(&name) {
+            continue;
+        }
+        if connection_listed
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(name.as_str()))
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+
+    let stream = response.bytes_stream();
+    let body = if let Some(kind) = sse_kind {
+        stats::record_sse_stream();
+        Body::from_stream(stream.scan(SseTelemetry::new(kind), |state, chunk| {
+            if let Ok(bytes) = &chunk {
+                state.observe(bytes);
+            }
+            std::future::ready(Some(chunk))
+        }))
+    } else {
+        Body::from_stream(stream)
+    };
+    let mut response = builder.body(body)?;
+    insert_header(response.headers_mut(), "x-request-id", request_id);
+    if let Some(upstream_request_id) = upstream_request_id.as_deref() {
+        insert_header(
+            response.headers_mut(),
+            "headroom-upstream-request-id",
+            upstream_request_id,
+        );
+    }
+    Ok(response)
+}
+
+fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("request-id")
+        .or_else(|| headers.get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SseKind {
+    OpenAiChat,
+    OpenAiResponses,
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSocketKind {
+    CodexResponses,
+    Passthrough,
+}
+
+const OPENAI_RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+
+fn sse_stream_kind(headers: &HeaderMap, request_path: &str) -> Option<SseKind> {
+    let is_sse = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        });
+    if !is_sse {
+        return None;
+    }
+
+    if request_path == "/v1/messages" || request_path.starts_with("/v1/messages/") {
+        Some(SseKind::Anthropic)
+    } else if request_path == "/v1/chat/completions" {
+        Some(SseKind::OpenAiChat)
+    } else if request_path == "/v1/responses"
+        || request_path == "/v1/codex/responses"
+        || request_path == "/backend-api/responses"
+        || request_path == "/backend-api/codex/responses"
+    {
+        Some(SseKind::OpenAiResponses)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct SseTelemetry {
+    kind: SseKind,
+    buffer: Vec<u8>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    emitted: bool,
+}
+
+impl SseTelemetry {
+    fn new(kind: SseKind) -> Self {
+        Self {
+            kind,
+            buffer: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            emitted: false,
+        }
+    }
+
+    fn observe(&mut self, bytes: &Bytes) {
+        self.buffer.extend_from_slice(bytes);
+        while let Some(end) = sse_event_end(&self.buffer) {
+            let event = self.buffer.drain(..end).collect::<Vec<_>>();
+            while self
+                .buffer
+                .first()
+                .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+            {
+                self.buffer.remove(0);
+            }
+            self.observe_event(&event);
+        }
+
+        const MAX_BUFFER: usize = 1024 * 1024;
+        if self.buffer.len() > MAX_BUFFER {
+            let keep = self.buffer.split_off(self.buffer.len() - MAX_BUFFER / 2);
+            self.buffer = keep;
+        }
+    }
+
+    fn observe_event(&mut self, event: &[u8]) {
+        let Ok(text) = std::str::from_utf8(event) else {
+            return;
+        };
+        let event_type = text
+            .lines()
+            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("event:"))
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let data = text
+            .lines()
+            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.trim().is_empty() || data.trim() == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            return;
+        };
+
+        // Streaming CCR parity with the reference proxy: retrieval tool
+        // calls in SSE responses are resolved by the client, but the proxy
+        // still records them for observability.
+        if ccr_stream_tool_call_detected(self.kind, &value) {
+            stats::record_ccr_stream_tool_call();
+            info!(
+                provider = ?self.kind,
+                "ccr retrieval tool call detected in SSE stream (client-resolved)"
+            );
+        }
+
+        match self.kind {
+            SseKind::OpenAiChat => {
+                if let Some(usage) = value.get("usage") {
+                    self.absorb_usage(usage);
+                    self.emit_final("openai");
+                }
+            }
+            SseKind::OpenAiResponses => {
+                let kind = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .or(event_type.as_deref());
+                if matches!(
+                    kind,
+                    Some("response.completed" | "response.failed" | "response.incomplete")
+                ) {
+                    if let Some(usage) = value.get("usage").or_else(|| {
+                        value
+                            .get("response")
+                            .and_then(|response| response.get("usage"))
+                    }) {
+                        self.absorb_usage(usage);
+                    }
+                    self.emit_final("openai");
+                }
+            }
+            SseKind::Anthropic => {
+                let kind = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .or(event_type.as_deref());
+                match kind {
+                    Some("message_start") => {
+                        if let Some(usage) = value
+                            .get("message")
+                            .and_then(|message| message.get("usage"))
+                            .or_else(|| value.get("usage"))
+                        {
+                            self.absorb_usage(usage);
+                        }
+                    }
+                    Some("message_delta") => {
+                        if let Some(usage) = value.get("usage") {
+                            self.absorb_usage(usage);
+                        }
+                    }
+                    Some("message_stop") => self.emit_final("anthropic"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn absorb_usage(&mut self, usage: &Value) {
+        let input = usage_u64(usage, &["prompt_tokens", "input_tokens"]);
+        let output = usage_u64(usage, &["completion_tokens", "output_tokens"]);
+        let details = usage
+            .get("prompt_tokens_details")
+            .or_else(|| usage.get("input_tokens_details"));
+        let cache_read = details
+            .and_then(|details| usage_u64_opt(details, &["cached_tokens"]))
+            .or_else(|| usage_u64_opt(usage, &["cache_read_input_tokens"]))
+            .unwrap_or_default();
+        let cache_creation = usage_u64(usage, &["cache_creation_input_tokens"]);
+
+        self.input_tokens = self.input_tokens.max(input);
+        self.output_tokens = self.output_tokens.max(output);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.max(cache_read);
+        self.cache_creation_input_tokens = self.cache_creation_input_tokens.max(cache_creation);
+    }
+
+    fn emit_final(&mut self, provider: &str) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        if self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_input_tokens == 0
+            && self.cache_creation_input_tokens == 0
+        {
+            return;
+        }
+
+        stats::record_sse_usage(
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+        );
+
+        let denominator = match self.kind {
+            SseKind::Anthropic => self
+                .input_tokens
+                .saturating_add(self.cache_read_input_tokens)
+                .saturating_add(self.cache_creation_input_tokens),
+            SseKind::OpenAiChat | SseKind::OpenAiResponses => self.input_tokens,
+        };
+        if denominator > 0 && self.cache_read_input_tokens <= denominator {
+            stats::record_sse_cache_hit_rate(
+                provider,
+                self.cache_read_input_tokens as f64 / denominator as f64,
+            );
+        }
+    }
+}
+
+/// Detects a `headroom_retrieve` tool call inside an SSE event without
+/// mutating the stream.
+fn ccr_stream_tool_call_detected(kind: SseKind, value: &Value) -> bool {
+    match kind {
+        SseKind::Anthropic => {
+            value.get("type").and_then(Value::as_str) == Some("content_block_start")
+                && value.get("content_block").is_some_and(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(is_retrieve_tool_name)
+                })
+        }
+        SseKind::OpenAiChat => {
+            value
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    choices.iter().any(|choice| {
+                        choice
+                            .get("delta")
+                            .and_then(|delta| delta.get("tool_calls"))
+                            .and_then(Value::as_array)
+                            .is_some_and(|calls| {
+                                calls.iter().any(|call| {
+                                    call.get("function")
+                                        .and_then(|function| function.get("name"))
+                                        .and_then(Value::as_str)
+                                        .is_some_and(is_retrieve_tool_name)
+                                })
+                            })
+                    })
+                })
+        }
+        SseKind::OpenAiResponses => {
+            value.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+                && value.get("item").is_some_and(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call")
+                        && item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(is_retrieve_tool_name)
+                })
+        }
+    }
+}
+
+fn sse_event_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index + 2)
+        .or_else(|| {
+            buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+        })
+}
+
+fn usage_u64(value: &Value, keys: &[&str]) -> u64 {
+    usage_u64_opt(value, keys).unwrap_or_default()
+}
+
+fn usage_u64_opt(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+}
+
+fn apply_compression_response_headers(headers: &mut HeaderMap, mutation: &RequestCompression) {
+    let tokens_saved = mutation.tokens_before.saturating_sub(mutation.tokens_after);
+    insert_header(
+        headers,
+        "x-headroom-tokens-before",
+        &mutation.tokens_before.to_string(),
+    );
+    insert_header(
+        headers,
+        "x-headroom-tokens-after",
+        &mutation.tokens_after.to_string(),
+    );
+    insert_header(
+        headers,
+        "x-headroom-tokens-saved",
+        &tokens_saved.to_string(),
+    );
+    if mutation.compressed {
+        insert_header(headers, "x-headroom-transforms", "ccr_live_zone");
+    }
+    if !mutation.hashes.is_empty() {
+        insert_header(headers, "x-headroom-ccr-hashes", &mutation.hashes.join(","));
+    }
+    if let Some(reason) = &mutation.skipped_reason {
+        insert_header(headers, "x-headroom-skipped-reason", reason);
+    }
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(HeaderName::from_static(name), value);
+    }
+}
+
+fn is_application_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+        .unwrap_or(false)
+}
+
+fn compression_bypass_requested(headers: &HeaderMap) -> bool {
+    let bypass = headers
+        .get("x-headroom-bypass")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+    let passthrough_mode = headers
+        .get("x-headroom-mode")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("passthrough"));
+    bypass || passthrough_mode
+}
+
+fn ensure_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(generate_request_id)
+}
+
+fn forwarded_for(headers: &HeaderMap, client_addr: Option<SocketAddr>) -> Option<String> {
+    let existing = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty());
+    match (existing, client_addr) {
+        (Some(existing), Some(addr)) => Some(format!("{existing}, {}", addr.ip())),
+        (Some(existing), None) => Some(existing.to_string()),
+        (None, Some(addr)) => Some(addr.ip().to_string()),
+        (None, None) => None,
+    }
+}
+
+fn classify_auth_mode(headers: &HeaderMap) -> RequestAuthMode {
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if [
+        "claude-cli/",
+        "claude-code/",
+        "codex-cli/",
+        "cursor/",
+        "claude-vscode/",
+        "github-copilot/",
+        "anthropic-cli/",
+    ]
+    .iter()
+    .any(|prefix| user_agent.contains(prefix))
+    {
+        return RequestAuthMode::Subscription;
+    }
+
+    let auth = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if let Some(token) = auth.strip_prefix("Bearer ") {
+        if token.starts_with("sk-ant-oat-") {
+            return RequestAuthMode::OAuth;
+        }
+        if token.starts_with("sk-ant-api") || token.starts_with("sk-") {
+            return RequestAuthMode::Payg;
+        }
+        if token.split('.').count() >= 3 {
+            return RequestAuthMode::OAuth;
+        }
+    } else if !auth.is_empty() {
+        return RequestAuthMode::OAuth;
+    }
+
+    if headers.contains_key("x-api-key") || headers.contains_key("x-goog-api-key") {
+        return RequestAuthMode::Payg;
+    }
+
+    RequestAuthMode::Payg
+}
+
+fn chatgpt_account_id_from_authorization(headers: &HeaderMap) -> Option<String> {
+    if headers.get("chatgpt-account-id").is_some() {
+        return None;
+    }
+
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    let (scheme, token) = auth.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let payload = token.split('.').nth(1)?;
+    let decoded = decode_base64_url(payload)?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    let account_id = value
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()?
+        .trim();
+    (!account_id.is_empty()).then(|| account_id.to_string())
+}
+
+fn decode_base64_url(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = base64_url_value(byte)? as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xff) as u8);
+            buffer &= (1_u32 << bits) - 1;
+        }
+    }
+
+    Some(output)
+}
+
+fn base64_url_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'-' | b'+' => Some(62),
+        b'_' | b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn generate_request_id() -> String {
+    let counter = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("hr-{nanos}-{counter}")
+}
+
+fn connection_listed_headers(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn is_request_drop_header(name: &HeaderName) -> bool {
+    is_hop_by_hop(name)
+        || name == HOST
+        || name == CONTENT_LENGTH
+        || name.as_str().eq_ignore_ascii_case("x-request-id")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-for")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-proto")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
+        || name.as_str().eq_ignore_ascii_case("x-headroom-bypass")
+        || name.as_str().eq_ignore_ascii_case("x-headroom-mode")
+        || name.as_str().starts_with("x-headroom-")
+}
+
+fn is_response_drop_header(name: &HeaderName) -> bool {
+    is_hop_by_hop(name)
+}
+
+fn is_hop_by_hop(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+async fn proxy_websocket(
+    client_socket: WebSocket,
+    state: ProxyState,
+    uri: Uri,
+    headers: HeaderMap,
+    provider: UpstreamProvider,
+    client_addr: Option<SocketAddr>,
+) {
+    stats::record_websocket_open();
+    info!(path = %uri.path(), provider = ?provider, "websocket open");
+
+    let result = match websocket_kind(uri.path(), provider) {
+        WebSocketKind::CodexResponses => {
+            proxy_codex_responses_websocket(client_socket, state, uri.clone(), headers, client_addr)
+                .await
+        }
+        WebSocketKind::Passthrough => {
+            proxy_passthrough_websocket(
+                client_socket,
+                state,
+                uri.clone(),
+                headers,
+                provider,
+                client_addr,
+            )
+            .await
+        }
+    };
+
+    if let Err(err) = result {
+        info!(error = %err, "websocket proxy ended with error");
+    }
+
+    stats::record_websocket_close();
+    info!(path = %uri.path(), provider = ?provider, "websocket close");
+}
+
+async fn proxy_passthrough_websocket(
+    client_socket: WebSocket,
+    state: ProxyState,
+    uri: Uri,
+    headers: HeaderMap,
+    provider: UpstreamProvider,
+    client_addr: Option<SocketAddr>,
+) -> HrResult<()> {
+    let url = websocket_url(&state, provider, &uri)?;
+    let mut request = url.as_str().into_client_request()?;
+    copy_websocket_headers(&headers, request.headers_mut(), client_addr);
+
+    let (upstream_socket, _) = tokio_tungstenite::connect_async(request).await?;
+    let (mut client_tx, mut client_rx) = client_socket.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream_socket.split();
+
+    let client_to_upstream = async {
+        while let Some(message) = client_rx.next().await {
+            let message = message?;
+            trace!(kind = ?message, "client websocket frame");
+            let Some(message) = axum_to_tungstenite(message) else {
+                break;
+            };
+            upstream_tx.send(message).await?;
+        }
+        HrResult::<()>::Ok(())
+    };
+
+    let upstream_to_client = async {
+        while let Some(message) = upstream_rx.next().await {
+            let message = message?;
+            trace!(kind = ?message, "upstream websocket frame");
+            let Some(message) = tungstenite_to_axum(message) else {
+                break;
+            };
+            client_tx.send(message).await?;
+        }
+        HrResult::<()>::Ok(())
+    };
+
+    tokio::select! {
+        result = client_to_upstream => result,
+        result = upstream_to_client => result,
+    }
+}
+
+async fn proxy_codex_responses_websocket(
+    mut client_socket: WebSocket,
+    state: ProxyState,
+    uri: Uri,
+    headers: HeaderMap,
+    client_addr: Option<SocketAddr>,
+) -> HrResult<()> {
+    let Some(first_message) = client_socket.next().await else {
+        return Ok(());
+    };
+    let first_message = first_message?;
+    let Some((first_message, first_text_for_fallback)) =
+        prepare_client_codex_ws_message(first_message, &state, &headers)
+    else {
+        return Ok(());
+    };
+
+    let url = websocket_url(&state, UpstreamProvider::OpenAi, &uri)?;
+    let mut request = url.as_str().into_client_request()?;
+    copy_websocket_headers(&headers, request.headers_mut(), client_addr);
+    ensure_openai_responses_websocket_beta(request.headers_mut());
+
+    let upstream_socket = match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _response)) => socket,
+        Err(err) => {
+            return codex_ws_http_fallback(
+                client_socket,
+                state,
+                uri,
+                headers,
+                first_text_for_fallback,
+                client_addr,
+                &err.to_string(),
+            )
+            .await;
+        }
+    };
+
+    let (mut client_tx, mut client_rx) = client_socket.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream_socket.split();
+    upstream_tx.send(first_message).await?;
+
+    let client_state = state.clone();
+    let client_headers = headers.clone();
+    let client_to_upstream = async move {
+        while let Some(message) = client_rx.next().await {
+            let message = message?;
+            trace!(kind = ?message, "client websocket frame");
+            let Some((message, _fallback_text)) =
+                prepare_client_codex_ws_message(message, &client_state, &client_headers)
+            else {
+                break;
+            };
+            upstream_tx.send(message).await?;
+        }
+        HrResult::<()>::Ok(())
+    };
+
+    let upstream_to_client = async move {
+        let mut telemetry = OpenAiResponsesWsTelemetry::default();
+        while let Some(message) = upstream_rx.next().await {
+            let message = message?;
+            trace!(kind = ?message, "upstream websocket frame");
+            if let TungsteniteMessage::Text(text) = &message {
+                telemetry.observe_text(text);
+            }
+            let Some(message) = tungstenite_to_axum(message) else {
+                break;
+            };
+            client_tx.send(message).await?;
+        }
+        HrResult::<()>::Ok(())
+    };
+
+    tokio::select! {
+        result = client_to_upstream => result,
+        result = upstream_to_client => result,
+    }
+}
+
+fn websocket_kind(path: &str, provider: UpstreamProvider) -> WebSocketKind {
+    if provider == UpstreamProvider::OpenAi
+        && matches!(
+            path,
+            "/v1/responses"
+                | "/v1/codex/responses"
+                | "/backend-api/responses"
+                | "/backend-api/codex/responses"
+        )
+    {
+        WebSocketKind::CodexResponses
+    } else {
+        WebSocketKind::Passthrough
+    }
+}
+
+fn prepare_client_codex_ws_message(
+    message: AxumWsMessage,
+    state: &ProxyState,
+    headers: &HeaderMap,
+) -> Option<(TungsteniteMessage, Option<String>)> {
+    let message = axum_to_tungstenite(message)?;
+    if let TungsteniteMessage::Text(text) = message {
+        let raw_text = text.to_string();
+        let rewritten = maybe_compress_codex_response_create_frame(&raw_text, state, headers);
+        Some((
+            TungsteniteMessage::Text(rewritten.clone().into()),
+            Some(rewritten),
+        ))
+    } else {
+        Some((message, None))
+    }
+}
+
+fn maybe_compress_codex_response_create_frame(
+    raw_text: &str,
+    state: &ProxyState,
+    headers: &HeaderMap,
+) -> String {
+    let Ok(mut frame) = serde_json::from_str::<Value>(raw_text) else {
+        return raw_text.to_string();
+    };
+    if frame
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| kind != "response.create")
+    {
+        return raw_text.to_string();
+    }
+
+    if !state.compression_enabled || !state.compression_mode.allows_compression() {
+        stats::record_skipped_request("compression_disabled");
+        return raw_text.to_string();
+    }
+    if compression_bypass_requested(headers) {
+        stats::record_skipped_request("bypass_header");
+        return raw_text.to_string();
+    }
+
+    let wrapped = frame.get("response").is_some();
+    let body_value = if wrapped {
+        frame.get("response").cloned().unwrap_or(Value::Null)
+    } else {
+        frame.clone()
+    };
+    let Ok(body) = serde_json::to_vec(&body_value) else {
+        return raw_text.to_string();
+    };
+
+    let mut mutation = compress_json_request_with_auth(
+        &body,
+        ApiShape::OpenAiResponses,
+        &state.store,
+        classify_auth_mode(headers),
+    );
+    record_mutation_stats(&mutation);
+    if !mutation.compressed {
+        return raw_text.to_string();
+    }
+
+    if wrapped {
+        match serde_json::from_slice::<Value>(&mutation.body) {
+            Ok(mutated_response) => {
+                frame["response"] = mutated_response;
+                serde_json::to_string(&frame).unwrap_or_else(|_| raw_text.to_string())
+            }
+            Err(_) => raw_text.to_string(),
+        }
+    } else {
+        String::from_utf8(std::mem::take(&mut mutation.body))
+            .unwrap_or_else(|_| raw_text.to_string())
+    }
+}
+
+async fn codex_ws_http_fallback(
+    mut client_socket: WebSocket,
+    state: ProxyState,
+    uri: Uri,
+    headers: HeaderMap,
+    first_text: Option<String>,
+    client_addr: Option<SocketAddr>,
+    connect_error: &str,
+) -> HrResult<()> {
+    let Some(first_text) = first_text else {
+        return Err(error(format!(
+            "codex websocket upstream failed before a text response.create frame: {connect_error}"
+        )));
+    };
+    let Some(body) = codex_ws_http_fallback_body(&first_text) else {
+        return Err(error(format!(
+            "codex websocket upstream failed and first frame cannot be converted to HTTP fallback: {connect_error}"
+        )));
+    };
+
+    let upstream_url = upstream_url(&state, UpstreamProvider::OpenAi, &uri)?;
+    let request_id = ensure_request_id(&headers);
+    let mut fallback_headers = headers.clone();
+    ensure_openai_responses_websocket_beta(&mut fallback_headers);
+    let mut builder = state
+        .client
+        .post(upstream_url.clone())
+        .header(CONTENT_TYPE, "application/json")
+        .body(body);
+    builder = apply_headers(builder, &fallback_headers, client_addr, &request_id);
+    let response = builder.send().await?;
+
+    info!(
+        upstream = %upstream_url,
+        status = %response.status(),
+        reason = connect_error,
+        "codex websocket using http streaming fallback"
+    );
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        let error_frame = json!({
+            "type": "response.failed",
+            "error": {
+                "type": "upstream_error",
+                "status": status.as_u16(),
+                "message": text,
+            }
+        });
+        client_socket
+            .send(AxumWsMessage::Text(error_frame.to_string().into()))
+            .await?;
+        return Err(error(format!(
+            "codex websocket http fallback returned {status}"
+        )));
+    }
+
+    relay_sse_response_over_websocket(response, client_socket).await
+}
+
+fn codex_ws_http_fallback_body(first_text: &str) -> Option<Vec<u8>> {
+    let frame = serde_json::from_str::<Value>(first_text).ok()?;
+    if frame
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| kind != "response.create")
+    {
+        return None;
+    }
+
+    let mut body = match frame.get("response").cloned() {
+        Some(response) => response,
+        None => frame,
+    };
+    if let Value::Object(object) = &mut body {
+        object.remove("type");
+        object.insert("stream".to_string(), Value::Bool(true));
+    }
+    serde_json::to_vec(&body).ok()
+}
+
+async fn relay_sse_response_over_websocket(
+    response: reqwest::Response,
+    mut client_socket: WebSocket,
+) -> HrResult<()> {
+    let mut telemetry = OpenAiResponsesWsTelemetry::default();
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::<u8>::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buffer.extend_from_slice(&chunk);
+        while let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line = buffer.drain(..=line_end).collect::<Vec<_>>();
+            let Ok(line) = String::from_utf8(line) else {
+                continue;
+            };
+            let line = line.trim_end_matches(['\r', '\n']);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim_start();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            telemetry.observe_text(data);
+            client_socket
+                .send(AxumWsMessage::Text(data.to_string().into()))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct OpenAiResponsesWsTelemetry {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+}
+
+impl OpenAiResponsesWsTelemetry {
+    fn observe_text(&mut self, text: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        let kind = value.get("type").and_then(Value::as_str);
+        if !matches!(
+            kind,
+            Some("response.completed" | "response.failed" | "response.incomplete")
+        ) {
+            return;
+        }
+        if let Some(usage) = value.get("usage").or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("usage"))
+        }) {
+            self.absorb_usage(usage);
+        }
+        self.emit_final();
+    }
+
+    fn absorb_usage(&mut self, usage: &Value) {
+        let input = usage_u64(usage, &["prompt_tokens", "input_tokens"]);
+        let output = usage_u64(usage, &["completion_tokens", "output_tokens"]);
+        let details = usage
+            .get("prompt_tokens_details")
+            .or_else(|| usage.get("input_tokens_details"));
+        let cache_read = details
+            .and_then(|details| usage_u64_opt(details, &["cached_tokens"]))
+            .or_else(|| usage_u64_opt(usage, &["cache_read_input_tokens"]))
+            .unwrap_or_default();
+        let cache_creation = usage_u64(usage, &["cache_creation_input_tokens"]);
+
+        self.input_tokens = self.input_tokens.max(input);
+        self.output_tokens = self.output_tokens.max(output);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.max(cache_read);
+        self.cache_creation_input_tokens = self.cache_creation_input_tokens.max(cache_creation);
+    }
+
+    fn emit_final(&mut self) {
+        if self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_input_tokens == 0
+            && self.cache_creation_input_tokens == 0
+        {
+            return;
+        }
+
+        stats::record_sse_usage(
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+        );
+        if self.input_tokens > 0 && self.cache_read_input_tokens <= self.input_tokens {
+            stats::record_sse_cache_hit_rate(
+                "openai",
+                self.cache_read_input_tokens as f64 / self.input_tokens as f64,
+            );
+        }
+
+        *self = Self::default();
+    }
+}
+
+fn ensure_openai_responses_websocket_beta(headers: &mut HeaderMap) {
+    let mut values = headers
+        .get("openai-beta")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if values
+        .iter()
+        .all(|value| !value.eq_ignore_ascii_case(OPENAI_RESPONSES_WEBSOCKET_BETA))
+    {
+        values.push(OPENAI_RESPONSES_WEBSOCKET_BETA.to_string());
+    }
+    if let Ok(value) = HeaderValue::from_str(&values.join(", ")) {
+        headers.insert(HeaderName::from_static("openai-beta"), value);
+    }
+}
+
+fn axum_to_tungstenite(message: AxumWsMessage) -> Option<TungsteniteMessage> {
+    match message {
+        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string().into())),
+        AxumWsMessage::Binary(bytes) => Some(TungsteniteMessage::Binary(bytes)),
+        AxumWsMessage::Ping(bytes) => Some(TungsteniteMessage::Ping(bytes)),
+        AxumWsMessage::Pong(bytes) => Some(TungsteniteMessage::Pong(bytes)),
+        AxumWsMessage::Close(Some(frame)) => {
+            Some(TungsteniteMessage::Close(Some(TungsteniteCloseFrame {
+                code: CloseCode::from(frame.code),
+                reason: frame.reason.to_string().into(),
+            })))
+        }
+        AxumWsMessage::Close(None) => Some(TungsteniteMessage::Close(None)),
+    }
+}
+
+fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<AxumWsMessage> {
+    match message {
+        TungsteniteMessage::Text(text) => Some(AxumWsMessage::Text(text.to_string().into())),
+        TungsteniteMessage::Binary(bytes) => Some(AxumWsMessage::Binary(bytes)),
+        TungsteniteMessage::Ping(bytes) => Some(AxumWsMessage::Ping(bytes)),
+        TungsteniteMessage::Pong(bytes) => Some(AxumWsMessage::Pong(bytes)),
+        TungsteniteMessage::Close(Some(frame)) => Some(AxumWsMessage::Close(Some(CloseFrame {
+            code: frame.code.into(),
+            reason: frame.reason.to_string().into(),
+        }))),
+        TungsteniteMessage::Close(None) => Some(AxumWsMessage::Close(None)),
+        TungsteniteMessage::Frame(_) => None,
+    }
+}
+
+fn copy_websocket_headers(from: &HeaderMap, to: &mut HeaderMap, client_addr: Option<SocketAddr>) {
+    let request_id = ensure_request_id(from);
+    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+        to.insert("x-request-id", value);
+    }
+    to.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+    if let Some(host) = from.get(HOST) {
+        to.insert("x-forwarded-host", host.clone());
+    }
+    if let Some(xff) = forwarded_for(from, client_addr) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&xff) {
+            to.insert("x-forwarded-for", value);
+        }
+    }
+    if let Some(account_id) = chatgpt_account_id_from_authorization(from) {
+        if let Ok(value) = HeaderValue::from_str(&account_id) {
+            to.insert("ChatGPT-Account-ID", value);
+        }
+    }
+    for (name, value) in from {
+        if should_skip_websocket_header(name) {
+            continue;
+        }
+        to.insert(name.clone(), value.clone());
+    }
+}
+
+fn should_skip_websocket_header(name: &HeaderName) -> bool {
+    name == HOST
+        || name == CONNECTION
+        || name == UPGRADE
+        || name.as_str().eq_ignore_ascii_case("sec-websocket-key")
+        || name.as_str().eq_ignore_ascii_case("sec-websocket-version")
+        || name
+            .as_str()
+            .eq_ignore_ascii_case("sec-websocket-extensions")
+        || name == CONTENT_LENGTH
+        || name.as_str().eq_ignore_ascii_case("x-request-id")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-for")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-proto")
+        || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
+        || name.as_str().starts_with("x-headroom-")
+}
+
+fn upstream_url(state: &ProxyState, provider: UpstreamProvider, uri: &Uri) -> HrResult<Url> {
+    let mut url = match provider {
+        UpstreamProvider::OpenAi => state.openai_upstream.clone(),
+        UpstreamProvider::Anthropic => state.anthropic_upstream.clone(),
+    };
+    apply_uri_path_and_query(&mut url, uri);
+    Ok(url)
+}
+
+fn websocket_url(state: &ProxyState, provider: UpstreamProvider, uri: &Uri) -> HrResult<Url> {
+    let mut url = upstream_url(state, provider, uri)?;
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        "ws" | "wss" => url.scheme(),
+        other => {
+            return Err(error(format!(
+                "unsupported upstream websocket scheme: {other}"
+            )))
+        }
+    }
+    .to_string();
+    url.set_scheme(&scheme)
+        .map_err(|_| error("failed to set websocket upstream scheme"))?;
+    Ok(url)
+}
+
+fn apply_uri_path_and_query(url: &mut Url, uri: &Uri) {
+    let base_path = url.path().trim_end_matches('/');
+    let request_path = uri.path();
+    let combined = if base_path.is_empty() || base_path == "/" {
+        request_path.to_string()
+    } else {
+        format!("{base_path}{request_path}")
+    };
+    url.set_path(&combined);
+    url.set_query(uri.query());
+}
+
+fn error_response(status: StatusCode, message: String) -> Response<Body> {
+    (status, message).into_response()
+}
+
+fn upstream_error_response(err: Box<dyn std::error::Error + Send + Sync>) -> Response<Body> {
+    let status = err
+        .downcast_ref::<reqwest::Error>()
+        .filter(|err| err.is_timeout())
+        .map(|_| StatusCode::GATEWAY_TIMEOUT)
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    error_response(status, err.to_string())
+}
+
+fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Body> {
+    match serde_json::to_vec(&value) {
+        Ok(body) => Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap_or_else(|err| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+            }),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_target_paths() {
+        assert_eq!(
+            classify_request(&Method::POST, "/v1/messages"),
+            RequestClass {
+                provider: UpstreamProvider::Anthropic,
+                target: Some(CompressionTarget::AnthropicMessages),
+                skipped_reason: None
+            }
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/v1/chat/completions").target,
+            Some(CompressionTarget::OpenAiChatCompletions)
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/v1/responses").target,
+            Some(CompressionTarget::OpenAiResponses)
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/v1/codex/responses").target,
+            Some(CompressionTarget::OpenAiResponses)
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/backend-api/codex/responses").target,
+            Some(CompressionTarget::OpenAiResponses)
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/v1/messages/batches").target,
+            Some(CompressionTarget::AnthropicMessageBatches)
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/v1/messages/batches/batch_123/results").target,
+            None
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/v1/messages/count_tokens").provider,
+            UpstreamProvider::Anthropic
+        );
+        assert_eq!(
+            classify_request(&Method::GET, "/v1/responses").skipped_reason,
+            Some("non_post_method")
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/healthz").skipped_reason,
+            Some("reserved_proxy_endpoint")
+        );
+        assert_eq!(
+            classify_request(&Method::POST, "/v1/conversations").skipped_reason,
+            Some("conversations_passthrough")
+        );
+    }
+
+    #[test]
+    fn parses_compression_modes() {
+        assert_eq!(CompressionMode::parse("ccr").unwrap(), CompressionMode::Ccr);
+        assert_eq!(
+            CompressionMode::parse("passthrough").unwrap(),
+            CompressionMode::Passthrough
+        );
+        assert_eq!(CompressionMode::parse("off").unwrap(), CompressionMode::Off);
+        assert!(CompressionMode::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn detects_ccr_stream_tool_calls_per_provider() {
+        assert!(ccr_stream_tool_call_detected(
+            SseKind::Anthropic,
+            &json!({
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "headroom_retrieve"}
+            })
+        ));
+        assert!(!ccr_stream_tool_call_detected(
+            SseKind::Anthropic,
+            &json!({
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "other_tool"}
+            })
+        ));
+        assert!(!ccr_stream_tool_call_detected(
+            SseKind::Anthropic,
+            &json!({
+                "type": "content_block_start",
+                "content_block": {"type": "text", "text": "headroom_retrieve"}
+            })
+        ));
+        assert!(ccr_stream_tool_call_detected(
+            SseKind::OpenAiChat,
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{"index": 0, "function": {"name": "headroom_retrieve"}}]
+                    }
+                }]
+            })
+        ));
+        assert!(!ccr_stream_tool_call_detected(
+            SseKind::OpenAiChat,
+            &json!({"choices": [{"delta": {"content": "headroom_retrieve"}}]})
+        ));
+        assert!(ccr_stream_tool_call_detected(
+            SseKind::OpenAiResponses,
+            &json!({
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "name": "mcp__headroom_retrieve"}
+            })
+        ));
+        assert!(!ccr_stream_tool_call_detected(
+            SseKind::OpenAiResponses,
+            &json!({
+                "type": "response.output_item.added",
+                "item": {"type": "reasoning"}
+            })
+        ));
+    }
+
+    #[test]
+    fn extracts_ccr_tool_calls_per_provider_shape() {
+        let anthropic = json!({
+            "content": [
+                {"type": "text", "text": "thinking"},
+                {"type": "tool_use", "id": "toolu_1", "name": "headroom_retrieve",
+                 "input": {"hash": "a".repeat(24)}},
+                {"type": "tool_use", "id": "toolu_2", "name": "user_tool", "input": {}}
+            ]
+        });
+        let calls = extract_ccr_tool_calls(&anthropic, CcrProvider::Anthropic);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.hash, "a".repeat(24));
+
+        let openai = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "headroom_retrieve",
+                            "arguments": "{\"hash\":\"bbbbbbbbbbbbbbbbbbbbbbbb\",\"query\":\"x\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let calls = extract_ccr_tool_calls(&openai, CcrProvider::OpenAi);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.hash, "b".repeat(24));
+        assert_eq!(calls[0].1.query.as_deref(), Some("x"));
+
+        assert!(
+            extract_ccr_tool_calls(&json!({"content": "text"}), CcrProvider::Anthropic).is_empty()
+        );
+    }
+
+    #[test]
+    fn batch_results_path_is_recognized() {
+        assert_eq!(
+            anthropic_batch_results_batch_id(&Method::GET, "/v1/messages/batches/b_1/results"),
+            Some("b_1".to_string())
+        );
+        assert_eq!(
+            anthropic_batch_results_batch_id(&Method::POST, "/v1/messages/batches/b_1/results"),
+            None
+        );
+        assert_eq!(
+            anthropic_batch_results_batch_id(&Method::GET, "/v1/messages/batches/b_1"),
+            None
+        );
+        assert_eq!(
+            anthropic_batch_results_batch_id(&Method::GET, "/v1/messages/batches//results"),
+            None
+        );
+    }
+
+    #[test]
+    fn sse_state_machines_gate_usage_and_cache_hit_rate() {
+        stats::reset_for_tests();
+
+        let mut responses = SseTelemetry::new(SseKind::OpenAiResponses);
+        responses.observe(&Bytes::from_static(
+            br#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"hello"}
+
+"#,
+        ));
+        assert_eq!(stats::stats().sse_input_tokens, 0);
+        responses.observe(&Bytes::from_static(
+            br#"event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":20,"output_tokens":5,"input_tokens_details":{"cached_tokens":8}}}}
+
+"#,
+        ));
+        let snapshot = stats::stats();
+        assert_eq!(snapshot.sse_input_tokens, 20);
+        assert_eq!(snapshot.sse_output_tokens, 5);
+        assert_eq!(snapshot.sse_cache_read_input_tokens, 8);
+        let openai = snapshot.sse_cache_hit_rates.get("openai").unwrap();
+        assert_eq!(openai.count, 1);
+        assert!((openai.sum - 0.4).abs() < f64::EPSILON);
+
+        stats::reset_for_tests();
+        let mut anthropic = SseTelemetry::new(SseKind::Anthropic);
+        anthropic.observe(&Bytes::from_static(
+            br#"event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":25,"cache_creation_input_tokens":5}}}
+
+"#,
+        ));
+        anthropic.observe(&Bytes::from_static(
+            br#"event: message_delta
+data: {"type":"message_delta","usage":{"output_tokens":9}}
+
+"#,
+        ));
+        assert_eq!(stats::stats().sse_input_tokens, 0);
+        anthropic.observe(&Bytes::from_static(
+            br#"event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+        ));
+        let snapshot = stats::stats();
+        assert_eq!(snapshot.sse_input_tokens, 100);
+        assert_eq!(snapshot.sse_output_tokens, 9);
+        assert_eq!(snapshot.sse_cache_read_input_tokens, 25);
+        assert_eq!(snapshot.sse_cache_creation_input_tokens, 5);
+        let anthropic = snapshot.sse_cache_hit_rates.get("anthropic").unwrap();
+        assert_eq!(anthropic.count, 1);
+        assert!((anthropic.sum - (25.0 / 130.0)).abs() < f64::EPSILON);
+    }
+}
