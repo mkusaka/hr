@@ -14,9 +14,11 @@ The proxy compresses these JSON request shapes:
 - `POST /v1/messages`
 - `POST /v1/messages/batches`
 
-Anthropic subpaths such as `/v1/messages/count_tokens` and
-batch read/result/cancel/delete paths are routed to the Anthropic upstream
-without compression. Other paths route to the OpenAI upstream unless they are
+Anthropic subpaths such as `/v1/messages/count_tokens` and batch
+read/cancel/delete paths are routed to the Anthropic upstream without request
+compression. Batch results pass through unchanged unless this proxy previously
+created the batch and can post-process `headroom_retrieve` tool calls from its
+stored batch context. Other paths route to the OpenAI upstream unless they are
 reserved proxy-local endpoints.
 
 It also reserves proxy-local endpoints for health, metrics, stats, and CCR
@@ -80,8 +82,10 @@ hr proxy \
 Known JSON LLM request paths are buffered up to `--max-body-bytes`,
 conservatively compressed, and then forwarded. Non-JSON bodies, non-target
 paths, Conversations API paths (`/v1/conversations*`), and other HTTP requests
-stream through without request mutation. WebSocket upgrades are passed through
-to the selected upstream.
+stream through without request mutation. Codex Responses WebSocket sessions on
+`/v1/responses` aliases compress client `response.create` frames and otherwise
+relay bidirectionally; other WebSocket upgrades pass through to the selected
+upstream.
 
 Use `--compression false`, `--compression-mode off`, or
 `--compression-mode passthrough` to disable target request mutation. The
@@ -131,13 +135,26 @@ When a non-streaming JSON response from `/v1/messages` or
 `/v1/chat/completions` contains `headroom_retrieve` tool calls, the proxy
 resolves them from the CCR store and continues the conversation upstream
 (up to 3 rounds) so the client receives the final response without seeing the
-retrieval tool call. If a continuation request fails or the round limit is
-hit, the latest upstream response is returned as-is. Anthropic batch results
-get the same treatment: the proxy records each batch create's compressed
-params, and `GET /v1/messages/batches/{id}/results` lines whose message holds
-a `headroom_retrieve` tool call are continued against `/v1/messages` using the
-caller's auth headers before the JSONL is returned. Results for batches the
-proxy did not create pass through unchanged.
+retrieval tool call. Continuation is attempted only when every tool call in the
+response is a `headroom_retrieve` call and, for OpenAI, the response has a
+single choice; multi-choice responses are never auto-continued. Mixed responses
+keep client-owned tool calls and strip the proxy-private retrieval calls
+instead — including when a mixed response arrives after a continuation round, a
+failed continuation request, or the round limit. An OpenAI choice left with no
+tool calls after stripping is rewritten as a normal text turn
+(`finish_reason: "stop"`). Only when the response still contains nothing but
+unresolved retrieval calls (after a failure, the round limit, or the
+multi-choice skip) is the latest upstream response returned as-is. Anthropic
+batch results get the same treatment: the proxy records each batch create's
+compressed params, and `GET /v1/messages/batches/{id}/results` lines whose
+message holds only `headroom_retrieve` tool calls are continued against
+`/v1/messages` using the caller's auth headers before the JSONL is returned;
+mixed result lines have their private retrieval calls stripped the same way.
+Batch contexts are retained in memory for 24 hours, up to 10000 batches.
+Results for batches the proxy did not create, or whose context has expired,
+pass through unchanged. The proxy assumes a single trust boundary: every
+client sharing one `hr` instance shares its CCR store and batch contexts, so
+run separate instances for mutually untrusted clients.
 
 Current live-zone policy:
 
@@ -174,7 +191,8 @@ curl -X POST http://127.0.0.1:8787/v1/retrieve \
 
 Logs are structured `tracing` JSON. Use `--log-level info`, `debug`, or `trace`
 to control startup/request summaries, classification and byte/token decisions,
-and truncated internal diagnostics.
+and internal diagnostics such as WebSocket frame kinds and sizes. Request and
+frame contents are never logged at any level.
 
 ## Library
 

@@ -37,14 +37,23 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Maximum proxy-side `headroom_retrieve` continuation rounds per response,
 /// mirroring the reference handler's `max_retrieval_rounds`.
 const MAX_CCR_CONTINUATION_ROUNDS: usize = 3;
+/// Batch contexts live for 24 hours in the reference Headroom proxy.
+const BATCH_CONTEXT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Maximum batch contexts retained for CCR batch-result post-processing.
-const MAX_BATCH_CONTEXTS: usize = 64;
+const MAX_BATCH_CONTEXTS: usize = 10_000;
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Per-batch CCR context: batch id paired with each request's compressed
 /// params keyed by `custom_id`.
-type BatchContexts = VecDeque<(String, HashMap<String, Value>)>;
+type BatchContexts = VecDeque<BatchContextEntry>;
+
+#[derive(Debug, Clone)]
+struct BatchContextEntry {
+    batch_id: String,
+    contexts: HashMap<String, Value>,
+    expires_at: SystemTime,
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -300,26 +309,35 @@ impl ProxyState {
             return;
         }
 
+        let now = SystemTime::now();
+        let expires_at = now + BATCH_CONTEXT_TTL;
         let mut store = self
             .batch_contexts
             .lock()
             .expect("batch context lock poisoned");
-        store.push_back((batch_id.to_string(), contexts));
+        store.retain(|entry| entry.expires_at > now && entry.batch_id != batch_id);
+        store.push_back(BatchContextEntry {
+            batch_id: batch_id.to_string(),
+            contexts,
+            expires_at,
+        });
         while store.len() > MAX_BATCH_CONTEXTS {
             store.pop_front();
         }
     }
 
     fn batch_context(&self, batch_id: &str) -> Option<HashMap<String, Value>> {
-        let store = self
+        let now = SystemTime::now();
+        let mut store = self
             .batch_contexts
             .lock()
             .expect("batch context lock poisoned");
+        store.retain(|entry| entry.expires_at > now);
         store
             .iter()
             .rev()
-            .find(|(id, _)| id == batch_id)
-            .map(|(_, contexts)| contexts.clone())
+            .find(|entry| entry.batch_id == batch_id)
+            .map(|entry| entry.contexts.clone())
     }
 }
 
@@ -1183,7 +1201,7 @@ async fn forward_with_ccr_continuation(
         );
     }
 
-    let (final_response, progressed) = run_ccr_continuation(
+    let (final_response, changed) = run_ccr_continuation(
         state,
         &request_body,
         initial,
@@ -1193,7 +1211,7 @@ async fn forward_with_ccr_continuation(
         provider,
     )
     .await;
-    if !progressed {
+    if !changed {
         // No continuation round succeeded — return the upstream bytes
         // untouched so the client can resolve the tool call itself.
         return buffered_response_to_axum(
@@ -1218,7 +1236,7 @@ fn ccr_response_buffer_eligible(response: &reqwest::Response) -> bool {
 }
 
 /// Runs the CCR continuation loop. Returns the latest upstream response and
-/// whether at least one continuation round completed successfully.
+/// whether it was changed by continuation or private-tool stripping.
 async fn run_ccr_continuation(
     state: &ProxyState,
     request_body: &Value,
@@ -1234,12 +1252,37 @@ async fn run_ccr_continuation(
         .cloned()
         .unwrap_or_default();
     let mut current = initial;
-    let mut progressed = false;
+    let mut changed = false;
     let mut rounds = 0;
 
     while rounds < MAX_CCR_CONTINUATION_ROUNDS {
+        let tool_call_count = provider_tool_calls(&current, provider).len();
         let ccr_calls = extract_ccr_tool_calls(&current, provider);
         if ccr_calls.is_empty() {
+            break;
+        }
+        if provider == CcrProvider::OpenAi && openai_choice_count(&current) != 1 {
+            warn!(
+                choices = openai_choice_count(&current),
+                "ccr continuation skipped because multiple OpenAI choices are present"
+            );
+            if let Some(stripped) = strip_ccr_tool_calls(&current, provider) {
+                current = stripped;
+                changed = true;
+            }
+            break;
+        }
+        if tool_call_count != ccr_calls.len() {
+            warn!(
+                total_tool_calls = tool_call_count,
+                ccr_tool_calls = ccr_calls.len(),
+                provider = provider.as_str(),
+                "ccr continuation skipped because non-headroom tool calls are present"
+            );
+            if let Some(stripped) = strip_ccr_tool_calls(&current, provider) {
+                current = stripped;
+                changed = true;
+            }
             break;
         }
         rounds += 1;
@@ -1286,7 +1329,7 @@ async fn run_ccr_continuation(
         {
             Ok(next) => {
                 stats::record_ccr_continuation_round();
-                progressed = true;
+                changed = true;
                 current = next;
             }
             Err(err) => {
@@ -1299,12 +1342,17 @@ async fn run_ccr_continuation(
         }
     }
 
+    if let Some(stripped) = strip_ccr_tool_calls(&current, provider) {
+        current = stripped;
+        changed = true;
+    }
+
     if rounds >= MAX_CCR_CONTINUATION_ROUNDS
         && !extract_ccr_tool_calls(&current, provider).is_empty()
     {
         warn!("ccr continuation hit max rounds with unresolved retrieval tool calls");
     }
-    (current, progressed)
+    (current, changed)
 }
 
 async fn send_ccr_continuation(
@@ -1340,7 +1388,17 @@ async fn send_ccr_continuation(
 
 /// Extracts `headroom_retrieve` tool calls from a provider-shaped response.
 fn extract_ccr_tool_calls(response: &Value, provider: CcrProvider) -> Vec<(Value, ParsedToolCall)> {
-    let tool_calls: Vec<&Value> = match provider {
+    provider_tool_calls(response, provider)
+        .into_iter()
+        .filter_map(|tool_call| {
+            parse_retrieve_tool_call(tool_call, provider.as_str())
+                .map(|parsed| (tool_call.clone(), parsed))
+        })
+        .collect()
+}
+
+fn provider_tool_calls(response: &Value, provider: CcrProvider) -> Vec<&Value> {
+    match provider {
         CcrProvider::Anthropic => response
             .get("content")
             .and_then(Value::as_array)
@@ -1354,24 +1412,116 @@ fn extract_ccr_tool_calls(response: &Value, provider: CcrProvider) -> Vec<(Value
         CcrProvider::OpenAi => response
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("tool_calls"))
-            .and_then(Value::as_array)
-            .map(|calls| calls.iter().collect())
+            .map(|choices| {
+                choices
+                    .iter()
+                    .filter_map(|choice| choice.get("message"))
+                    .filter_map(|message| message.get("tool_calls"))
+                    .filter_map(Value::as_array)
+                    .flat_map(|calls| calls.iter())
+                    .collect()
+            })
             .unwrap_or_default(),
-    };
+    }
+}
 
-    tool_calls
-        .into_iter()
-        .filter_map(|tool_call| {
-            parse_retrieve_tool_call(tool_call, provider.as_str())
-                .map(|parsed| (tool_call.clone(), parsed))
-        })
-        .collect()
+fn openai_choice_count(response: &Value) -> usize {
+    response
+        .get("choices")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default()
+}
+
+/// Removes proxy-private CCR retrieval calls from a mixed tool-call response,
+/// leaving client-owned tool calls visible to the caller.
+fn strip_ccr_tool_calls(response: &Value, provider: CcrProvider) -> Option<Value> {
+    match provider {
+        CcrProvider::Anthropic => {
+            let content = response.get("content").and_then(Value::as_array)?;
+            let mut removed = false;
+            let mut remaining_tool_calls = 0;
+            let stripped_content = content
+                .iter()
+                .filter_map(|block| {
+                    let is_tool_use = block.get("type").and_then(Value::as_str) == Some("tool_use");
+                    if is_tool_use && parse_retrieve_tool_call(block, provider.as_str()).is_some() {
+                        removed = true;
+                        return None;
+                    }
+                    if is_tool_use {
+                        remaining_tool_calls += 1;
+                    }
+                    Some(block.clone())
+                })
+                .collect::<Vec<_>>();
+
+            // Never strip a response down to zero tool_use blocks: that would
+            // leave `stop_reason: "tool_use"` with nothing to respond to.
+            // Headroom-only responses are left to the continuation loop (or
+            // returned as-is on failure/round limit).
+            if !removed || remaining_tool_calls == 0 {
+                return None;
+            }
+            let mut stripped = response.clone();
+            stripped["content"] = Value::Array(stripped_content);
+            Some(stripped)
+        }
+        CcrProvider::OpenAi => {
+            let mut stripped = response.clone();
+            let choices = stripped
+                .get_mut("choices")
+                .and_then(Value::as_array_mut)
+                .filter(|choices| !choices.is_empty())?;
+            let mut removed = false;
+            let mut remaining_tool_calls = 0;
+            for choice in choices.iter_mut() {
+                let (original_len, stripped_len) = {
+                    let Some(tool_calls) = choice
+                        .get_mut("message")
+                        .and_then(|message| message.get_mut("tool_calls"))
+                        .and_then(Value::as_array_mut)
+                    else {
+                        continue;
+                    };
+                    let original_len = tool_calls.len();
+                    tool_calls
+                        .retain(|call| parse_retrieve_tool_call(call, provider.as_str()).is_none());
+                    (original_len, tool_calls.len())
+                };
+                if stripped_len != original_len {
+                    removed = true;
+                }
+                remaining_tool_calls += stripped_len;
+                // Keep the choice in place so `index` stays aligned with array
+                // position, but rewrite a now tool-free choice as a normal text
+                // turn: an empty `tool_calls` array with `finish_reason:
+                // "tool_calls"` would leave the client nothing to respond to.
+                if original_len > 0 && stripped_len == 0 {
+                    if let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut)
+                    {
+                        message.remove("tool_calls");
+                    }
+                    if choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls") {
+                        choice["finish_reason"] = Value::String("stop".to_string());
+                    }
+                }
+            }
+            // A response whose only tool calls were proxy-private is left to the
+            // continuation loop (or returned as-is on failure/round limit).
+            if !removed || remaining_tool_calls == 0 {
+                return None;
+            }
+            Some(stripped)
+        }
+    }
 }
 
 /// Rebuilds the assistant turn from a provider response for continuation.
+///
+/// The OpenAI arm reads `choices[0]` only: `run_ccr_continuation` skips
+/// continuation for multi-choice responses, so a single choice is guaranteed
+/// here. Revisit this if that guard ever changes.
 fn extract_assistant_message(response: &Value, provider: CcrProvider) -> Value {
     match provider {
         CcrProvider::Anthropic => json!({
@@ -1528,7 +1678,7 @@ async fn forward_batch_results(
             continue;
         }
 
-        let (final_message, progressed) = run_ccr_continuation(
+        let (final_message, changed) = run_ccr_continuation(
             &state,
             params,
             message,
@@ -1538,7 +1688,7 @@ async fn forward_batch_results(
             CcrProvider::Anthropic,
         )
         .await;
-        if progressed {
+        if changed {
             result["result"]["message"] = final_message;
             stats::record_ccr_batch_result_processed();
             processed_any = true;
@@ -2401,7 +2551,12 @@ async fn proxy_passthrough_websocket(
     let client_to_upstream = async {
         while let Some(message) = client_rx.next().await {
             let message = message?;
-            trace!(kind = ?message, "client websocket frame");
+            let (frame_kind, frame_bytes) = axum_ws_frame_summary(&message);
+            trace!(
+                kind = frame_kind,
+                bytes = frame_bytes,
+                "client websocket frame"
+            );
             let Some(message) = axum_to_tungstenite(message) else {
                 break;
             };
@@ -2413,7 +2568,12 @@ async fn proxy_passthrough_websocket(
     let upstream_to_client = async {
         while let Some(message) = upstream_rx.next().await {
             let message = message?;
-            trace!(kind = ?message, "upstream websocket frame");
+            let (frame_kind, frame_bytes) = tungstenite_ws_frame_summary(&message);
+            trace!(
+                kind = frame_kind,
+                bytes = frame_bytes,
+                "upstream websocket frame"
+            );
             let Some(message) = tungstenite_to_axum(message) else {
                 break;
             };
@@ -2475,7 +2635,12 @@ async fn proxy_codex_responses_websocket(
     let client_to_upstream = async move {
         while let Some(message) = client_rx.next().await {
             let message = message?;
-            trace!(kind = ?message, "client websocket frame");
+            let (frame_kind, frame_bytes) = axum_ws_frame_summary(&message);
+            trace!(
+                kind = frame_kind,
+                bytes = frame_bytes,
+                "client websocket frame"
+            );
             let Some((message, _fallback_text)) =
                 prepare_client_codex_ws_message(message, &client_state, &client_headers)
             else {
@@ -2490,7 +2655,12 @@ async fn proxy_codex_responses_websocket(
         let mut telemetry = OpenAiResponsesWsTelemetry::default();
         while let Some(message) = upstream_rx.next().await {
             let message = message?;
-            trace!(kind = ?message, "upstream websocket frame");
+            let (frame_kind, frame_bytes) = tungstenite_ws_frame_summary(&message);
+            trace!(
+                kind = frame_kind,
+                bytes = frame_bytes,
+                "upstream websocket frame"
+            );
             if let TungsteniteMessage::Text(text) = &message {
                 telemetry.observe_text(text);
             }
@@ -2816,6 +2986,30 @@ fn ensure_openai_responses_websocket_beta(headers: &mut HeaderMap) {
     }
 }
 
+/// Frame kind and payload size for trace logging. Frame contents are never
+/// logged: text frames carry prompt/response bodies.
+fn axum_ws_frame_summary(message: &AxumWsMessage) -> (&'static str, usize) {
+    match message {
+        AxumWsMessage::Text(text) => ("text", text.len()),
+        AxumWsMessage::Binary(bytes) => ("binary", bytes.len()),
+        AxumWsMessage::Ping(bytes) => ("ping", bytes.len()),
+        AxumWsMessage::Pong(bytes) => ("pong", bytes.len()),
+        AxumWsMessage::Close(_) => ("close", 0),
+    }
+}
+
+/// See [`axum_ws_frame_summary`].
+fn tungstenite_ws_frame_summary(message: &TungsteniteMessage) -> (&'static str, usize) {
+    match message {
+        TungsteniteMessage::Text(text) => ("text", text.len()),
+        TungsteniteMessage::Binary(bytes) => ("binary", bytes.len()),
+        TungsteniteMessage::Ping(bytes) => ("ping", bytes.len()),
+        TungsteniteMessage::Pong(bytes) => ("pong", bytes.len()),
+        TungsteniteMessage::Close(_) => ("close", 0),
+        TungsteniteMessage::Frame(frame) => ("frame", frame.len()),
+    }
+}
+
 fn axum_to_tungstenite(message: AxumWsMessage) -> Option<TungsteniteMessage> {
     match message {
         AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string().into())),
@@ -3089,6 +3283,10 @@ mod tests {
         let calls = extract_ccr_tool_calls(&anthropic, CcrProvider::Anthropic);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1.hash, "a".repeat(24));
+        assert_eq!(
+            provider_tool_calls(&anthropic, CcrProvider::Anthropic).len(),
+            2
+        );
 
         let openai = json!({
             "choices": [{
@@ -3113,6 +3311,228 @@ mod tests {
         assert!(
             extract_ccr_tool_calls(&json!({"content": "text"}), CcrProvider::Anthropic).is_empty()
         );
+    }
+
+    #[test]
+    fn strips_ccr_tool_calls_from_mixed_provider_responses() {
+        let anthropic = json!({
+            "content": [
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "toolu_headroom", "name": "headroom_retrieve",
+                 "input": {"hash": "a".repeat(24)}},
+                {"type": "tool_use", "id": "toolu_project", "name": "project_tool", "input": {}}
+            ],
+            "stop_reason": "tool_use"
+        });
+        let stripped = strip_ccr_tool_calls(&anthropic, CcrProvider::Anthropic).unwrap();
+        let content = stripped["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["name"], "project_tool");
+
+        let openai = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_headroom",
+                            "type": "function",
+                            "function": {
+                                "name": "headroom_retrieve",
+                                "arguments": "{\"hash\":\"bbbbbbbbbbbbbbbbbbbbbbbb\"}"
+                            }
+                        },
+                        {
+                            "id": "call_project",
+                            "type": "function",
+                            "function": {
+                                "name": "project_tool",
+                                "arguments": "{}"
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+        let stripped = strip_ccr_tool_calls(&openai, CcrProvider::OpenAi).unwrap();
+        let calls = stripped["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "project_tool");
+
+        let headroom_only = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "headroom_retrieve",
+                "input": {"hash": "c".repeat(24)}
+            }]
+        });
+        assert!(strip_ccr_tool_calls(&headroom_only, CcrProvider::Anthropic).is_none());
+    }
+
+    #[test]
+    fn strip_keeps_choice_positions_and_rewrites_tool_free_choices() {
+        let headroom_call = json!({
+            "id": "call_headroom",
+            "type": "function",
+            "function": {
+                "name": "headroom_retrieve",
+                "arguments": "{\"hash\":\"dddddddddddddddddddddddd\"}"
+            }
+        });
+        let project_call = json!({
+            "id": "call_project",
+            "type": "function",
+            "function": {"name": "project_tool", "arguments": "{}"}
+        });
+
+        // A multi-choice response where one choice carried only the private
+        // retrieval call must keep both choices: dropping the choice would
+        // desync `index` from array position and lose its other fields.
+        let multi_choice = json!({
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": null,
+                                "tool_calls": [headroom_call.clone()]},
+                    "finish_reason": "tool_calls"
+                },
+                {
+                    "index": 1,
+                    "message": {"role": "assistant", "content": null,
+                                "tool_calls": [project_call.clone()]},
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        });
+        let stripped = strip_ccr_tool_calls(&multi_choice, CcrProvider::OpenAi).unwrap();
+        let choices = stripped["choices"].as_array().unwrap();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0]["index"], 0);
+        // The now tool-free choice loses its empty `tool_calls` array and its
+        // `finish_reason: "tool_calls"` so the client is not left waiting to
+        // answer a tool call that no longer exists.
+        assert!(choices[0]["message"].get("tool_calls").is_none());
+        assert_eq!(choices[0]["finish_reason"], "stop");
+        assert_eq!(choices[1]["index"], 1);
+        assert_eq!(
+            choices[1]["message"]["tool_calls"][0]["function"]["name"],
+            "project_tool"
+        );
+        assert_eq!(choices[1]["finish_reason"], "tool_calls");
+
+        // A response whose only tool calls are private stays untouched so the
+        // continuation loop (or the as-is fallback) can handle it.
+        let headroom_only = json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": null,
+                            "tool_calls": [headroom_call]},
+                "finish_reason": "tool_calls"
+            }]
+        });
+        assert!(strip_ccr_tool_calls(&headroom_only, CcrProvider::OpenAi).is_none());
+    }
+
+    #[test]
+    fn batch_context_replaces_duplicate_and_drops_expired_entries() {
+        let url = Url::parse("http://127.0.0.1:1").unwrap();
+        let state = ProxyState::new(url.clone(), url, SqliteStore::in_memory().unwrap());
+
+        state.record_batch_context(
+            "batch_1",
+            &json!({
+                "requests": [{
+                    "custom_id": "req_1",
+                    "params": {"model": "claude-test", "messages": []}
+                }]
+            }),
+        );
+        assert!(state
+            .batch_context("batch_1")
+            .unwrap()
+            .contains_key("req_1"));
+
+        state.record_batch_context(
+            "batch_1",
+            &json!({
+                "requests": [{
+                    "custom_id": "req_2",
+                    "params": {"model": "claude-test", "messages": []}
+                }]
+            }),
+        );
+        let replacement = state.batch_context("batch_1").unwrap();
+        assert!(!replacement.contains_key("req_1"));
+        assert!(replacement.contains_key("req_2"));
+
+        {
+            let mut store = state.batch_contexts.lock().unwrap();
+            store.push_back(BatchContextEntry {
+                batch_id: "expired".to_string(),
+                contexts: HashMap::new(),
+                expires_at: SystemTime::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap(),
+            });
+        }
+        assert!(state.batch_context("expired").is_none());
+        assert!(!state
+            .batch_contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.batch_id == "expired"));
+    }
+
+    #[test]
+    fn batch_context_sets_ttl_and_evicts_oldest_after_limit() {
+        let url = Url::parse("http://127.0.0.1:1").unwrap();
+        let state = ProxyState::new(url.clone(), url, SqliteStore::in_memory().unwrap());
+
+        let recorded_at = SystemTime::now();
+        state.record_batch_context(
+            "ttl_batch",
+            &json!({
+                "requests": [{
+                    "custom_id": "req",
+                    "params": {"model": "claude-test", "messages": []}
+                }]
+            }),
+        );
+        let entry = state.batch_contexts.lock().unwrap().back().unwrap().clone();
+        let ttl = entry.expires_at.duration_since(recorded_at).unwrap();
+        assert!(ttl >= BATCH_CONTEXT_TTL.saturating_sub(Duration::from_secs(1)));
+        assert!(ttl <= BATCH_CONTEXT_TTL + Duration::from_secs(1));
+
+        {
+            let mut store = state.batch_contexts.lock().unwrap();
+            store.clear();
+            for index in 0..MAX_BATCH_CONTEXTS {
+                store.push_back(BatchContextEntry {
+                    batch_id: format!("batch_{index}"),
+                    contexts: HashMap::new(),
+                    expires_at: SystemTime::now() + BATCH_CONTEXT_TTL,
+                });
+            }
+        }
+        state.record_batch_context(
+            "batch_new",
+            &json!({
+                "requests": [{
+                    "custom_id": "req_new",
+                    "params": {"model": "claude-test", "messages": []}
+                }]
+            }),
+        );
+
+        let store = state.batch_contexts.lock().unwrap();
+        assert_eq!(store.len(), MAX_BATCH_CONTEXTS);
+        assert!(!store.iter().any(|entry| entry.batch_id == "batch_0"));
+        assert!(store.iter().any(|entry| entry.batch_id == "batch_new"));
     }
 
     #[test]

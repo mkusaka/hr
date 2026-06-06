@@ -706,6 +706,154 @@ async fn ccr_continuation_stops_at_max_rounds() {
 }
 
 #[tokio::test]
+async fn ccr_continuation_strips_mixed_response_at_round_limit() {
+    let anthropic_capture = Capture::default();
+    let openai = spawn_upstream(Capture::default()).await;
+    let anthropic = spawn_anthropic_ccr_then_mixed_upstream(anthropic_capture.clone(), 3).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/messages"))
+        .json(&json!({
+            "model": "claude-test",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": long_text("round limit mixed")}]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let content = body["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["name"], "project_tool");
+    assert_eq!(anthropic_capture.bodies.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn ccr_continuation_strips_mixed_response_after_successful_round() {
+    let anthropic_capture = Capture::default();
+    let openai = spawn_upstream(Capture::default()).await;
+    let anthropic = spawn_anthropic_ccr_then_mixed_upstream(anthropic_capture.clone(), 1).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/messages"))
+        .json(&json!({
+            "model": "claude-test",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": long_text("mixed after round")}]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let content = body["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["name"], "project_tool");
+    // Initial request plus exactly one successful continuation round; the
+    // mixed follow-up response breaks the loop instead of continuing.
+    assert_eq!(anthropic_capture.bodies.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn mixed_anthropic_tool_calls_are_not_auto_continued() {
+    let anthropic_capture = Capture::default();
+    let openai = spawn_upstream(Capture::default()).await;
+    let anthropic = spawn_anthropic_mixed_tool_upstream(anthropic_capture.clone()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/messages"))
+        .json(&json!({
+            "model": "claude-test",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": long_text("mixed tools")}]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let content = body["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["name"], "project_tool");
+    assert_eq!(anthropic_capture.bodies.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn mixed_openai_tool_calls_are_not_auto_continued() {
+    let openai_capture = Capture::default();
+    let openai = spawn_openai_mixed_tool_upstream(openai_capture.clone()).await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-test",
+            "messages": [
+                {"role": "user", "content": long_text("mixed openai tools")}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let choices = body["choices"].as_array().unwrap();
+    assert_eq!(choices.len(), 2);
+    let first_tool_calls = choices[0]["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(first_tool_calls.len(), 1);
+    assert_eq!(first_tool_calls[0]["function"]["name"], "project_tool");
+    let second_tool_calls = choices[1]["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(second_tool_calls.len(), 1);
+    assert_eq!(second_tool_calls[0]["function"]["name"], "project_tool");
+    assert_eq!(openai_capture.bodies.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn mixed_openai_single_choice_tool_calls_are_not_auto_continued() {
+    let openai_capture = Capture::default();
+    let openai = spawn_openai_single_choice_mixed_upstream(openai_capture.clone()).await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-test",
+            "messages": [
+                {"role": "user", "content": long_text("single choice mixed")}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let choices = body["choices"].as_array().unwrap();
+    assert_eq!(choices.len(), 1);
+    let tool_calls = choices[0]["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0]["function"]["name"], "project_tool");
+    assert_eq!(choices[0]["finish_reason"], "tool_calls");
+    assert_eq!(openai_capture.bodies.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn anthropic_batch_results_ccr_tool_calls_are_continued() {
     let capture = Capture::default();
     let openai = spawn_upstream(Capture::default()).await;
@@ -764,6 +912,50 @@ async fn anthropic_batch_results_ccr_tool_calls_are_continued() {
         .as_str()
         .unwrap()
         .contains(&latest));
+}
+
+#[tokio::test]
+async fn anthropic_batch_results_mixed_tool_calls_strip_private_retrieval() {
+    let capture = Capture::default();
+    let openai = spawn_upstream(Capture::default()).await;
+    let anthropic = spawn_anthropic_batch_mixed_tool_upstream(capture.clone()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    post_json(
+        proxy,
+        "/v1/messages/batches",
+        json!({
+            "requests": [{
+                "custom_id": "req-1",
+                "params": {
+                    "model": "claude-test",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": long_text("batch mixed")}]}]
+                }
+            }]
+        }),
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{proxy}/v1/messages/batches/batch_test/results"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = response.text().await.unwrap();
+    let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(line["custom_id"], "req-1");
+    let content = line["result"]["message"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["name"], "project_tool");
+
+    let paths = capture.paths.lock().unwrap();
+    assert_eq!(paths.len(), 2);
+    assert!(!paths.iter().any(|path| path == "/v1/messages"));
 }
 
 #[tokio::test]
@@ -2110,6 +2302,104 @@ async fn spawn_anthropic_ccr_upstream(
     spawn_app(app).await
 }
 
+/// Anthropic upstream that returns CCR-only tool calls for the first
+/// `headroom_rounds` requests, then a mixed private/client tool-call response.
+async fn spawn_anthropic_ccr_then_mixed_upstream(
+    capture: Capture,
+    headroom_rounds: usize,
+) -> SocketAddr {
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let capture = capture.clone();
+            move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    let value = capture_request(&capture, request).await;
+                    let call_index = capture.bodies.lock().unwrap().len();
+                    let hash = marker_hash(&value);
+                    if call_index <= headroom_rounds {
+                        Json(json!({
+                            "id": format!("msg_{call_index}"),
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "tool_use",
+                                "id": format!("toolu_{call_index}"),
+                                "name": "headroom_retrieve",
+                                "input": {"hash": hash}
+                            }],
+                            "stop_reason": "tool_use"
+                        }))
+                    } else {
+                        Json(json!({
+                            "id": "msg_mixed_limit",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_headroom_limit",
+                                    "name": "headroom_retrieve",
+                                    "input": {"hash": hash}
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_project_limit",
+                                    "name": "project_tool",
+                                    "input": {"path": "Cargo.toml"}
+                                }
+                            ],
+                            "stop_reason": "tool_use"
+                        }))
+                    }
+                }
+            }
+        }),
+    );
+    spawn_app(app).await
+}
+
+/// Anthropic upstream that returns a headroom retrieval tool call together
+/// with a client-owned tool call. The proxy must not continue this response,
+/// because it cannot synthesize the non-headroom tool result.
+async fn spawn_anthropic_mixed_tool_upstream(capture: Capture) -> SocketAddr {
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let capture = capture.clone();
+            move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    let value = capture_request(&capture, request).await;
+                    let hash = marker_hash(&value);
+                    Json(json!({
+                        "id": "msg_mixed",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_headroom",
+                                "name": "headroom_retrieve",
+                                "input": {"hash": hash}
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_project",
+                                "name": "project_tool",
+                                "input": {"path": "Cargo.toml"}
+                            }
+                        ],
+                        "stop_reason": "tool_use"
+                    }))
+                }
+            }
+        }),
+    );
+    spawn_app(app).await
+}
+
 /// OpenAI chat upstream: first request gets a `headroom_retrieve` tool call,
 /// subsequent requests get a final text completion.
 async fn spawn_openai_ccr_upstream(capture: Capture) -> SocketAddr {
@@ -2154,6 +2444,128 @@ async fn spawn_openai_ccr_upstream(capture: Capture) -> SocketAddr {
                             }]
                         }))
                     }
+                }
+            }
+        }),
+    );
+    spawn_app(app).await
+}
+
+/// OpenAI chat upstream that returns a single choice mixing a headroom
+/// retrieval tool call with a client-owned tool call. Exercises the
+/// mixed-tool-call guard inside the continuation loop (not the multi-choice
+/// guard).
+async fn spawn_openai_single_choice_mixed_upstream(capture: Capture) -> SocketAddr {
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let capture = capture.clone();
+            move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    let value = capture_request(&capture, request).await;
+                    let hash = marker_hash(&value);
+                    let headroom_arguments = json!({"hash": hash}).to_string();
+                    let project_arguments = json!({"path": "Cargo.toml"}).to_string();
+                    Json(json!({
+                        "id": "chatcmpl_single_mixed",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_headroom",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "headroom_retrieve",
+                                            "arguments": headroom_arguments
+                                        }
+                                    },
+                                    {
+                                        "id": "call_project",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "project_tool",
+                                            "arguments": project_arguments
+                                        }
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    }))
+                }
+            }
+        }),
+    );
+    spawn_app(app).await
+}
+
+/// OpenAI chat upstream that returns a headroom retrieval tool call together
+/// with a client-owned tool call. The proxy must not continue this response,
+/// and must not expose its private retrieval tool call to the client.
+async fn spawn_openai_mixed_tool_upstream(capture: Capture) -> SocketAddr {
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let capture = capture.clone();
+            move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    let value = capture_request(&capture, request).await;
+                    let hash = marker_hash(&value);
+                    let headroom_arguments = json!({"hash": hash}).to_string();
+                    let project_arguments_0 = json!({"path": "Cargo.toml"}).to_string();
+                    let project_arguments_1 = json!({"path": "src/proxy.rs"}).to_string();
+                    Json(json!({
+                        "id": "chatcmpl_mixed",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_project_0",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "project_tool",
+                                            "arguments": project_arguments_0
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            },
+                            {
+                                "index": 1,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_headroom",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "headroom_retrieve",
+                                                "arguments": headroom_arguments
+                                            }
+                                        },
+                                        {
+                                            "id": "call_project_1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "project_tool",
+                                                "arguments": project_arguments_1
+                                            }
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls"
+                            }
+                        ]
+                    }))
                 }
             }
         }),
@@ -2230,6 +2642,103 @@ async fn spawn_anthropic_batch_ccr_upstream(capture: Capture) -> SocketAddr {
                         "type": "message",
                         "role": "assistant",
                         "content": [{"type": "text", "text": "final answer"}],
+                        "stop_reason": "end_turn"
+                    }))
+                }
+            }),
+        );
+    spawn_app(app).await
+}
+
+/// Anthropic batch upstream whose result line contains both the private
+/// retrieval tool call and a client-owned tool call.
+async fn spawn_anthropic_batch_mixed_tool_upstream(capture: Capture) -> SocketAddr {
+    let create_capture = capture.clone();
+    let results_capture = capture.clone();
+    let messages_capture = capture.clone();
+    let app = Router::new()
+        .route(
+            "/v1/messages/batches",
+            post(move |request: Request<Body>| {
+                let capture = create_capture.clone();
+                async move {
+                    capture_request(&capture, request).await;
+                    Json(json!({
+                        "id": "batch_test",
+                        "type": "message_batch",
+                        "processing_status": "in_progress"
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1/messages/batches/{id}/results",
+            axum::routing::get(move |request: Request<Body>| {
+                let capture = results_capture.clone();
+                async move {
+                    capture
+                        .headers
+                        .lock()
+                        .unwrap()
+                        .push(request.headers().clone());
+                    capture
+                        .paths
+                        .lock()
+                        .unwrap()
+                        .push(request.uri().path().to_string());
+                    capture.raw_bodies.lock().unwrap().push(Vec::new());
+
+                    let hash = capture
+                        .bodies
+                        .lock()
+                        .unwrap()
+                        .first()
+                        .map(marker_hash)
+                        .unwrap_or_else(|| "ab".repeat(12));
+                    let line = json!({
+                        "custom_id": "req-1",
+                        "result": {
+                            "type": "succeeded",
+                            "message": {
+                                "id": "msg_b1",
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_headroom_b1",
+                                        "name": "headroom_retrieve",
+                                        "input": {"hash": hash}
+                                    },
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_project_b1",
+                                        "name": "project_tool",
+                                        "input": {"path": "Cargo.toml"}
+                                    }
+                                ],
+                                "stop_reason": "tool_use"
+                            }
+                        }
+                    });
+                    (
+                        [("content-type", "application/x-jsonl")],
+                        format!("{line}\n"),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(move |request: Request<Body>| {
+                let capture = messages_capture.clone();
+                async move {
+                    capture_request(&capture, request).await;
+                    Json(json!({
+                        "id": "msg_final",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "unexpected continuation"}],
                         "stop_reason": "end_turn"
                     }))
                 }
