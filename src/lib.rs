@@ -1,6 +1,8 @@
 pub mod ccr;
 pub mod compression;
 pub mod proxy;
+pub mod session;
+pub mod sse;
 pub mod stats;
 
 pub use ccr::{
@@ -8,8 +10,9 @@ pub use ccr::{
     SqliteStore, HASH_HEX_LEN,
 };
 pub use compression::{
-    compress, compress_json_request, compress_json_request_with_auth, estimate_tokens, ApiShape,
-    CompressOptions, CompressResult, RequestAuthMode, RequestCompression,
+    compress, compress_json_request, compress_json_request_ctx, compress_json_request_with_auth,
+    estimate_tokens, ApiShape, CompressContext, CompressOptions, CompressResult, RequestAuthMode,
+    RequestCompression,
 };
 pub use proxy::{
     build_router, classify_request, serve_proxy, CompressionMode, CompressionTarget, ProxyConfig,

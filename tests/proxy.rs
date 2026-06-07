@@ -68,7 +68,9 @@ async fn compresses_anthropic_messages() {
             "messages": [
                 {"role": "user", "content": "old"},
                 {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
-                {"role": "user", "content": [{"type": "text", "text": latest}]}
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tr_1", "content": latest}
+                ]}
             ]
         }),
     )
@@ -78,7 +80,7 @@ async fn compresses_anthropic_messages() {
     let body = bodies.last().unwrap();
     assert_eq!(body["system"], "stable");
     assert_eq!(body["messages"][0]["content"], "old");
-    assert!(body["messages"][2]["content"][0]["text"]
+    assert!(body["messages"][2]["content"][0]["content"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -103,7 +105,8 @@ async fn compresses_openai_chat_completions() {
         json!({
             "messages": [
                 {"role": "system", "content": "stable"},
-                {"role": "user", "content": latest}
+                {"role": "user", "content": "ask"},
+                {"role": "tool", "tool_call_id": "call_bulk", "content": latest}
             ]
         }),
     )
@@ -112,7 +115,10 @@ async fn compresses_openai_chat_completions() {
     let bodies = openai_capture.bodies.lock().unwrap();
     let body = bodies.last().unwrap();
     assert_eq!(body["messages"][0]["content"], "stable");
-    assert!(body["messages"][1]["content"]
+    // User text is protected by default (reference role gate); the
+    // latest tool output compresses.
+    assert_eq!(body["messages"][1]["content"], "ask");
+    assert!(body["messages"][2]["content"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -134,7 +140,7 @@ async fn compresses_openai_responses() {
         "/v1/responses",
         json!({
             "input": [
-                {"role": "user", "content": [{"type": "input_text", "text": latest}]}
+                {"type": "function_call_output", "call_id": "call_a", "output": latest}
             ]
         }),
     )
@@ -142,7 +148,7 @@ async fn compresses_openai_responses() {
 
     let bodies = openai_capture.bodies.lock().unwrap();
     let body = bodies.last().unwrap();
-    assert!(body["input"][0]["content"][0]["text"]
+    assert!(body["input"][0]["output"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -166,14 +172,14 @@ async fn compresses_codex_response_aliases() {
         "/backend-api/codex/responses",
         json!({
             "input": [
-                {"role": "user", "content": [{"type": "input_text", "text": latest}]}
+                {"type": "function_call_output", "call_id": "call_a", "output": latest}
             ]
         }),
     )
     .await;
 
     let bodies = openai_capture.bodies.lock().unwrap();
-    assert!(bodies[0]["input"][0]["content"][0]["text"]
+    assert!(bodies[0]["input"][0]["output"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -203,7 +209,7 @@ async fn anthropic_subpaths_route_to_anthropic_upstream_without_compression() {
 }
 
 #[tokio::test]
-async fn openai_chat_mutates_latest_tool_and_latest_user_but_skips_retrieve_tool_output() {
+async fn openai_chat_mutates_latest_tool_skips_retrieve_output_and_protects_user_text() {
     let openai_capture = Capture::default();
     let openai = spawn_upstream(openai_capture.clone()).await;
     let anthropic = spawn_upstream(Capture::default()).await;
@@ -234,10 +240,9 @@ async fn openai_chat_mutates_latest_tool_and_latest_user_but_skips_retrieve_tool
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
-    assert!(body["messages"][3]["content"]
-        .as_str()
-        .unwrap()
-        .starts_with("<<ccr:"));
+    // User text is protected by default; opt-in is required to
+    // compress it (reference `compress_user_messages = False`).
+    assert_eq!(body["messages"][3]["content"], latest_user);
 }
 
 #[tokio::test]
@@ -463,7 +468,7 @@ async fn oauth_openai_requests_skip_prompt_cache_key_metadata() {
         .post(format!("http://{proxy}/v1/chat/completions"))
         .header("authorization", "Bearer oauth.header.payload")
         .json(&json!({
-            "messages": [{"role": "user", "content": long_text("oauth request")}]
+            "messages": [{"role": "tool", "tool_call_id": "call_bulk", "content": long_text("oauth request")}]
         }))
         .send()
         .await
@@ -502,7 +507,7 @@ async fn compression_disabled_streams_target_request_without_mutation() {
 }
 
 #[tokio::test]
-async fn anthropic_batch_create_compresses_each_request_params() {
+async fn anthropic_batch_create_compresses_and_injects_tool_per_compressed_request() {
     let anthropic_capture = Capture::default();
     let openai = spawn_upstream(Capture::default()).await;
     let anthropic = spawn_upstream(anthropic_capture.clone()).await;
@@ -518,14 +523,18 @@ async fn anthropic_batch_create_compresses_each_request_params() {
                     "params": {
                         "model": "claude-test",
                         "tools": [{"name": "z_user_tool", "input_schema": {"type": "object"}}],
-                        "messages": [{"role": "user", "content": [{"type": "text", "text": long_text("batch one")}]}]
+                        "messages": [{"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "tr_1", "content": long_text("batch one")}
+                        ]}]
                     }
                 },
                 {
                     "custom_id": "two",
                     "params": {
                         "model": "claude-test",
-                        "messages": [{"role": "user", "content": [{"type": "text", "text": long_text("batch two")}]}]
+                        "messages": [{"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "tr_2", "content": "tiny"}
+                        ]}]
                     }
                 }
             ]
@@ -540,17 +549,19 @@ async fn anthropic_batch_create_compresses_each_request_params() {
         "/v1/messages/batches"
     );
     assert!(
-        body["requests"][0]["params"]["messages"][0]["content"][0]["text"]
+        body["requests"][0]["params"]["messages"][0]["content"][0]["content"]
             .as_str()
             .unwrap()
             .starts_with("<<ccr:")
     );
-    assert!(
-        body["requests"][1]["params"]["messages"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("<<ccr:")
+    // The sub-threshold request is forwarded unchanged and, per the
+    // reference (`anthropic.py:2560-2574`), does NOT receive the
+    // retrieve tool: injection is per-request, compressed only.
+    assert_eq!(
+        body["requests"][1]["params"]["messages"][0]["content"][0]["content"],
+        "tiny"
     );
+    assert!(body["requests"][1]["params"].get("tools").is_none());
     assert!(body["requests"][0]["params"]["tools"]
         .as_array()
         .unwrap()
@@ -599,7 +610,9 @@ async fn anthropic_ccr_tool_call_is_resolved_by_proxy_continuation() {
             "model": "claude-test",
             "max_tokens": 128,
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": latest}]}
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tr_1", "content": latest}
+                ]}
             ]
         }))
         .send()
@@ -618,7 +631,7 @@ async fn anthropic_ccr_tool_call_is_resolved_by_proxy_continuation() {
     assert_eq!(continuation["max_tokens"], 128);
     let messages = continuation["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 3);
-    assert!(messages[0]["content"][0]["text"]
+    assert!(messages[0]["content"][0]["content"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -645,7 +658,10 @@ async fn openai_ccr_tool_call_is_resolved_by_proxy_continuation() {
         .post(format!("http://{proxy}/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-test",
-            "messages": [{"role": "user", "content": latest}]
+            "messages": [
+                {"role": "user", "content": "please"},
+                {"role": "tool", "tool_call_id": "call_bulk", "content": latest}
+            ]
         }))
         .send()
         .await
@@ -660,19 +676,20 @@ async fn openai_ccr_tool_call_is_resolved_by_proxy_continuation() {
     let continuation = &bodies[1];
     assert_eq!(continuation["model"], "gpt-test");
     let messages = continuation["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 3);
-    assert!(messages[0]["content"]
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0]["content"], "please");
+    assert!(messages[1]["content"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
-    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[2]["role"], "assistant");
     assert_eq!(
-        messages[1]["tool_calls"][0]["function"]["name"],
+        messages[2]["tool_calls"][0]["function"]["name"],
         "headroom_retrieve"
     );
-    assert_eq!(messages[2]["role"], "tool");
-    assert_eq!(messages[2]["tool_call_id"], "call_1");
-    assert!(messages[2]["content"].as_str().unwrap().contains(&latest));
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "call_1");
+    assert!(messages[3]["content"].as_str().unwrap().contains(&latest));
 }
 
 #[tokio::test]
@@ -689,7 +706,9 @@ async fn ccr_continuation_stops_at_max_rounds() {
             "model": "claude-test",
             "max_tokens": 128,
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": latest}]}
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tr_1", "content": latest}
+                ]}
             ]
         }))
         .send()
@@ -718,7 +737,9 @@ async fn ccr_continuation_strips_mixed_response_at_round_limit() {
             "model": "claude-test",
             "max_tokens": 128,
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": long_text("round limit mixed")}]}
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tr_1", "content": long_text("round limit mixed")}
+                ]}
             ]
         }))
         .send()
@@ -746,7 +767,9 @@ async fn ccr_continuation_strips_mixed_response_after_successful_round() {
             "model": "claude-test",
             "max_tokens": 128,
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": long_text("mixed after round")}]}
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tr_1", "content": long_text("mixed after round")}
+                ]}
             ]
         }))
         .send()
@@ -776,7 +799,9 @@ async fn mixed_anthropic_tool_calls_are_not_auto_continued() {
             "model": "claude-test",
             "max_tokens": 128,
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": long_text("mixed tools")}]}
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tr_1", "content": long_text("mixed tools")}
+                ]}
             ]
         }))
         .send()
@@ -803,7 +828,7 @@ async fn mixed_openai_tool_calls_are_not_auto_continued() {
         .json(&json!({
             "model": "gpt-test",
             "messages": [
-                {"role": "user", "content": long_text("mixed openai tools")}
+                {"role": "tool", "tool_call_id": "call_bulk", "content": long_text("mixed openai tools")}
             ]
         }))
         .send()
@@ -835,7 +860,7 @@ async fn mixed_openai_single_choice_tool_calls_are_not_auto_continued() {
         .json(&json!({
             "model": "gpt-test",
             "messages": [
-                {"role": "user", "content": long_text("single choice mixed")}
+                {"role": "tool", "tool_call_id": "call_bulk", "content": long_text("single choice mixed")}
             ]
         }))
         .send()
@@ -870,7 +895,9 @@ async fn anthropic_batch_results_ccr_tool_calls_are_continued() {
                 "params": {
                     "model": "claude-test",
                     "max_tokens": 64,
-                    "messages": [{"role": "user", "content": [{"type": "text", "text": latest}]}]
+                    "messages": [{"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "tr_1", "content": latest}
+                    ]}]
                 }
             }]
         }),
@@ -930,7 +957,9 @@ async fn anthropic_batch_results_mixed_tool_calls_strip_private_retrieval() {
                 "params": {
                     "model": "claude-test",
                     "max_tokens": 64,
-                    "messages": [{"role": "user", "content": [{"type": "text", "text": long_text("batch mixed")}]}]
+                    "messages": [{"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "tr_1", "content": long_text("batch mixed")}
+                    ]}]
                 }
             }]
         }),
@@ -1096,14 +1125,16 @@ async fn anthropic_existing_tool_cache_control_preserves_tool_order_without_auto
                 }
             ],
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": long_text("existing tool cache control")}]}]
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tr_1", "content": long_text("existing tool cache control")}
+                ]}]
         }),
     )
     .await;
 
     let bodies = anthropic_capture.bodies.lock().unwrap();
     let tools = bodies[0]["tools"].as_array().unwrap();
-    assert!(bodies[0]["messages"][0]["content"][0]["text"]
+    assert!(bodies[0]["messages"][0]["content"][0]["content"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -1124,7 +1155,7 @@ async fn direct_decompress_from_proxy_store() {
     post_json(
         proxy,
         "/v1/chat/completions",
-        json!({"messages": [{"role": "user", "content": content}]}),
+        json!({"messages": [{"role": "tool", "tool_call_id": "call_bulk", "content": content}]}),
     )
     .await;
 
@@ -1182,10 +1213,8 @@ async fn codex_responses_websocket_compresses_response_create_frames_and_records
                 "type": "response.create",
                 "response": {
                     "input": [
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": long_text("codex ws first")}]
-                        }
+                        {"type": "function_call_output", "call_id": "call_a",
+                         "output": long_text("codex ws first")}
                     ]
                 }
             })
@@ -1225,10 +1254,8 @@ async fn codex_responses_websocket_compresses_response_create_frames_and_records
                 "type": "response.create",
                 "response": {
                     "input": [
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": long_text("codex ws second")}]
-                        }
+                        {"type": "function_call_output", "call_id": "call_b",
+                         "output": long_text("codex ws second")}
                     ]
                 }
             })
@@ -1243,7 +1270,7 @@ async fn codex_responses_websocket_compresses_response_create_frames_and_records
     assert_eq!(frames.len(), 3);
     let first: Value = serde_json::from_str(&frames[0]).unwrap();
     assert_eq!(first["type"], "response.create");
-    assert!(first["response"]["input"][0]["content"][0]["text"]
+    assert!(first["response"]["input"][0]["output"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -1257,7 +1284,7 @@ async fn codex_responses_websocket_compresses_response_create_frames_and_records
         json!({"type": "response.cancel", "response_id": "resp_1"})
     );
     let third: Value = serde_json::from_str(&frames[2]).unwrap();
-    assert!(third["response"]["input"][0]["content"][0]["text"]
+    assert!(third["response"]["input"][0]["output"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -1274,6 +1301,50 @@ async fn codex_responses_websocket_compresses_response_create_frames_and_records
     assert!(after.sse_input_tokens >= before.sse_input_tokens + 21);
     assert!(after.sse_output_tokens >= before.sse_output_tokens + 5);
     assert!(after.sse_cache_read_input_tokens >= before.sse_cache_read_input_tokens + 7);
+}
+
+#[tokio::test]
+async fn codex_responses_websocket_injects_retrieve_tool_for_marker_only_frames() {
+    let ws_capture = WsCapture::default();
+    let openai = spawn_codex_ws_capture_upstream(ws_capture.clone()).await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let (mut socket, _) = connect_async(format!("ws://{proxy}/v1/responses"))
+        .await
+        .unwrap();
+    // The frame carries an existing marker but nothing newly
+    // compressible: the metadata-only rewrite (retrieve-tool
+    // injection) must still reach upstream.
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({
+                "type": "response.create",
+                "response": {
+                    "input": [
+                        {"type": "function_call_output", "call_id": "call_a",
+                         "output": "<<ccr:aaaaaaaaaaaaaaaaaaaaaaaa>> summary"}
+                    ]
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = socket.next().await.unwrap().unwrap();
+
+    let frames = ws_capture.frames.lock().unwrap();
+    let frame: Value = serde_json::from_str(&frames[0]).unwrap();
+    assert_eq!(
+        frame["response"]["input"][0]["output"],
+        "<<ccr:aaaaaaaaaaaaaaaaaaaaaaaa>> summary"
+    );
+    assert!(frame["response"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "headroom_retrieve"));
 }
 
 #[tokio::test]
@@ -1340,10 +1411,8 @@ async fn codex_responses_websocket_falls_back_to_http_streaming_when_ws_upstream
                 "type": "response.create",
                 "response": {
                     "input": [
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": long_text("codex ws fallback")}]
-                        }
+                        {"type": "function_call_output", "call_id": "call_a",
+                         "output": long_text("codex ws fallback")}
                     ]
                 }
             })
@@ -1360,7 +1429,7 @@ async fn codex_responses_websocket_falls_back_to_http_streaming_when_ws_upstream
     let body = &bodies[0];
     assert_eq!(body["stream"], true);
     assert!(body.get("type").is_none());
-    assert!(body["input"][0]["content"][0]["text"]
+    assert!(body["input"][0]["output"]
         .as_str()
         .unwrap()
         .starts_with("<<ccr:"));
@@ -1376,7 +1445,7 @@ async fn stats_endpoint_reports_counters() {
     post_json(
         proxy,
         "/v1/chat/completions",
-        json!({"messages": [{"role": "user", "content": long_text("count me")}]}),
+        json!({"messages": [{"role": "tool", "tool_call_id": "call_bulk", "content": long_text("count me")}]}),
     )
     .await;
 
@@ -1486,7 +1555,7 @@ async fn compress_endpoint_compresses_without_forwarding() {
         .post(format!("http://{proxy}/v1/compress"))
         .json(&json!({
             "model": "gpt-test",
-            "messages": [{"role": "user", "content": long_text("compress endpoint content")}]
+            "messages": [{"role": "tool", "tool_call_id": "call_bulk", "content": long_text("compress endpoint content")}]
         }))
         .send()
         .await
@@ -1548,7 +1617,7 @@ async fn retrieve_endpoints_return_stored_original_and_stats() {
     post_json(
         proxy,
         "/v1/chat/completions",
-        json!({"messages": [{"role": "user", "content": content}]}),
+        json!({"messages": [{"role": "tool", "tool_call_id": "call_bulk", "content": content}]}),
     )
     .await;
     let marker = openai_capture.bodies.lock().unwrap()[0]["messages"][0]["content"]
@@ -1600,7 +1669,7 @@ async fn retrieve_tool_call_formats_provider_results() {
     post_json(
         proxy,
         "/v1/chat/completions",
-        json!({"messages": [{"role": "user", "content": content}]}),
+        json!({"messages": [{"role": "tool", "tool_call_id": "call_bulk", "content": content}]}),
     )
     .await;
     let marker = openai_capture.bodies.lock().unwrap()[0]["messages"][0]["content"]
@@ -1810,7 +1879,7 @@ async fn compression_response_headers_are_returned_to_client() {
     let response = reqwest::Client::new()
         .post(format!("http://{proxy}/v1/chat/completions"))
         .header("x-request-id", "req-compress")
-        .json(&json!({"messages": [{"role": "user", "content": long_text("return headers")}]}))
+        .json(&json!({"messages": [{"role": "tool", "tool_call_id": "call_bulk", "content": long_text("return headers")}]}))
         .send()
         .await
         .unwrap();
@@ -1942,6 +2011,464 @@ async fn sse_usage_is_recorded_without_mutating_stream_bytes() {
     assert!(after.sse_input_tokens >= before.sse_input_tokens + 10);
     assert!(after.sse_output_tokens >= before.sse_output_tokens + 4);
     assert!(after.sse_cache_read_input_tokens >= before.sse_cache_read_input_tokens + 3);
+}
+
+#[tokio::test]
+async fn anthropic_confirmed_cache_prefix_freezes_next_request_bytes() {
+    let capture = Capture::default();
+    let openai = spawn_upstream(Capture::default()).await;
+    let anthropic = spawn_anthropic_cached_usage_upstream(capture.clone()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+    let cached_bulk = long_text("cached prefix bulk");
+    let live_bulk = long_text("live turn bulk");
+    // A large uncompressed assistant turn keeps the per-message token
+    // estimates realistic: ~2005 tokens for message 1 vs ~14 for the
+    // marker-compressed message 0 and ~1005 for the upstream
+    // assistant reply, so 2200 confirmed cached tokens cover exactly
+    // the first two messages.
+    let assistant_bulk = "y".repeat(7000);
+
+    // Turn 1: the upstream confirms a large cached prefix
+    // (cache_read + cache_creation tokens) for this session.
+    post_json(
+        proxy,
+        "/v1/messages",
+        json!({
+            "model": "claude-test",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tr_1", "content": cached_bulk}
+                ]},
+                {"role": "assistant", "content": assistant_bulk}
+            ]
+        }),
+    )
+    .await;
+
+    // Turn 2 (same session: same model, no system prompt): the
+    // confirmed-cached prefix must stay byte-identical; only content
+    // beyond the frozen floor compresses.
+    let turn_two = json!({
+        "model": "claude-test",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tr_1", "content": cached_bulk}
+            ]},
+            {"role": "assistant", "content": assistant_bulk},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tr_2", "content": live_bulk}
+            ]}
+        ]
+    });
+    post_json(proxy, "/v1/messages", turn_two.clone()).await;
+
+    let bodies = capture.bodies.lock().unwrap();
+    // Turn 1 compressed the tool_result (no floor yet).
+    assert!(bodies[0]["messages"][0]["content"][0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("<<ccr:"));
+    // Turn 2: every byte up to the live-zone span (the whole frozen
+    // prefix included) is byte-identical to the client's
+    // serialization; only the live tool_result was spliced.
+    let raw_turn_two = capture.raw_bodies.lock().unwrap()[1].clone();
+    let client_bytes = serde_json::to_vec(&turn_two).unwrap();
+    let live_token = serde_json::to_string(&live_bulk).unwrap();
+    let client_text = std::str::from_utf8(&client_bytes).unwrap();
+    let live_span_start = client_text.find(&live_token).unwrap();
+    assert_eq!(
+        &raw_turn_two[..live_span_start],
+        &client_bytes[..live_span_start],
+        "confirmed-cached prefix must stay byte-identical"
+    );
+    assert!(bodies[1]["messages"][2]["content"][0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("<<ccr:"));
+}
+
+#[tokio::test]
+async fn responses_confirmed_cache_prefix_freezes_next_request_items() {
+    let capture = Capture::default();
+    let openai = spawn_responses_cached_usage_upstream(capture.clone()).await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+    let cached_output = long_text("responses cached prefix");
+    let live_output = long_text("responses live output");
+
+    let before = stats().sse_input_tokens;
+    // Turn 1: the SSE terminal event confirms a large cached prefix
+    // for this (model, no instructions) session.
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/responses"))
+        .json(&json!({
+            "model": "gpt-test",
+            "input": [
+                {"type": "function_call_output", "call_id": "c0", "output": cached_output}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("response.completed"));
+    // The state machine runs off the byte path; wait for it to absorb
+    // the terminal usage before issuing turn 2.
+    for _ in 0..100 {
+        if stats().sse_input_tokens > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(stats().sse_input_tokens > before);
+
+    // Turn 2 (same session): the confirmed-cached prefix item must
+    // stay untouched; only the new output compresses.
+    post_json(
+        proxy,
+        "/v1/responses",
+        json!({
+            "model": "gpt-test",
+            "input": [
+                {"type": "function_call_output", "call_id": "c0", "output": cached_output},
+                {"type": "function_call_output", "call_id": "c1", "output": live_output}
+            ]
+        }),
+    )
+    .await;
+
+    let bodies = capture.bodies.lock().unwrap();
+    assert!(bodies[0]["input"][0]["output"]
+        .as_str()
+        .unwrap()
+        .starts_with("<<ccr:"));
+    assert_eq!(bodies[1]["input"][0]["output"], cached_output);
+    assert!(bodies[1]["input"][1]["output"]
+        .as_str()
+        .unwrap()
+        .starts_with("<<ccr:"));
+}
+
+#[tokio::test]
+async fn responses_non_streaming_json_advances_the_session_floor() {
+    let capture = Capture::default();
+    let openai = spawn_responses_json_cached_usage_upstream(capture.clone()).await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+    let cached_output = long_text("responses json cached prefix");
+    let live_output = long_text("responses json live output");
+
+    // Turn 1: a plain JSON (non-SSE) response confirms a large cached
+    // prefix; the tracker must advance synchronously on this path.
+    post_json(
+        proxy,
+        "/v1/responses",
+        json!({
+            "model": "gpt-test",
+            "input": [
+                {"type": "function_call_output", "call_id": "c0", "output": cached_output}
+            ]
+        }),
+    )
+    .await;
+
+    // Turn 2 (same session): the confirmed-cached prefix item stays
+    // untouched; only the new output compresses.
+    post_json(
+        proxy,
+        "/v1/responses",
+        json!({
+            "model": "gpt-test",
+            "input": [
+                {"type": "function_call_output", "call_id": "c0", "output": cached_output},
+                {"type": "function_call_output", "call_id": "c1", "output": live_output}
+            ]
+        }),
+    )
+    .await;
+
+    {
+        let bodies = capture.bodies.lock().unwrap();
+        assert!(bodies[0]["input"][0]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("<<ccr:"));
+        assert_eq!(bodies[1]["input"][0]["output"], cached_output);
+        assert!(bodies[1]["input"][1]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("<<ccr:"));
+    }
+
+    // The buffered JSON branch records rate-limit gauges too (the
+    // upstream header value is unique to this test).
+    let metrics = reqwest::get(format!("http://{proxy}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics
+        .contains("proxy_rate_limit_remaining_input_tokens{provider=\"openai_responses\"} 5150"));
+}
+
+#[tokio::test]
+async fn anthropic_beta_header_sticks_across_session_requests() {
+    let capture = Capture::default();
+    let openai = spawn_upstream(Capture::default()).await;
+    let anthropic = spawn_upstream(capture.clone()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{proxy}/v1/messages"))
+        .header("anthropic-beta", "interleaved-thinking-2025-05-14")
+        .json(&json!({"model": "claude-test", "messages": [{"role": "user", "content": "one"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Later request in the same session without the header still
+    // carries the previously-seen beta upstream.
+    let response = client
+        .post(format!("http://{proxy}/v1/messages"))
+        .json(&json!({"model": "claude-test", "messages": [{"role": "user", "content": "two"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = capture.headers.lock().unwrap();
+    assert_eq!(
+        headers[0].get("anthropic-beta").unwrap(),
+        "interleaved-thinking-2025-05-14"
+    );
+    assert_eq!(
+        headers[1].get("anthropic-beta").unwrap(),
+        "interleaved-thinking-2025-05-14"
+    );
+}
+
+#[tokio::test]
+async fn openai_beta_header_sticks_across_chat_session_requests() {
+    let capture = Capture::default();
+    let openai = spawn_upstream(capture.clone()).await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .header("openai-beta", "some-chat-beta")
+        .json(&json!({
+            "model": "gpt-test",
+            "messages": [
+                {"role": "system", "content": "stable"},
+                {"role": "user", "content": "one"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Later request in the same session (same model + system) without
+    // the header still carries the previously-seen beta upstream,
+    // mirroring `openai.py:1535-1574`.
+    let response = client
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-test",
+            "messages": [
+                {"role": "system", "content": "stable"},
+                {"role": "user", "content": "two"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = capture.headers.lock().unwrap();
+    assert_eq!(headers[0].get("openai-beta").unwrap(), "some-chat-beta");
+    assert_eq!(headers[1].get("openai-beta").unwrap(), "some-chat-beta");
+}
+
+#[tokio::test]
+async fn subscription_user_agent_never_receives_cache_mutating_metadata() {
+    let openai_capture = Capture::default();
+    let openai = spawn_upstream(openai_capture.clone()).await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .header("user-agent", "antigravity/1.2.3")
+        .json(&json!({
+            "model": "gpt-test",
+            "tools": [
+                {"type": "function", "function": {"name": "zebra"}},
+                {"type": "function", "function": {"name": "apple"}}
+            ],
+            "messages": [
+                {"role": "tool", "tool_call_id": "call_bulk", "content": long_text("subscription")}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bodies = openai_capture.bodies.lock().unwrap();
+    let body = &bodies[0];
+    // Live-zone compression still applies on subscription auth...
+    assert!(body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("<<ccr:"));
+    // ...but cache-mutating metadata never does: no synthesized
+    // prompt_cache_key, and the tool array order is untouched.
+    assert!(body.get("prompt_cache_key").is_none());
+    assert_eq!(body["tools"][0]["function"]["name"], "zebra");
+    assert_eq!(body["tools"][1]["function"]["name"], "apple");
+}
+
+#[tokio::test]
+async fn empty_batch_create_is_rejected_with_400() {
+    let capture = Capture::default();
+    let openai = spawn_upstream(Capture::default()).await;
+    let anthropic = spawn_upstream(capture.clone()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/messages/batches"))
+        .json(&json!({"requests": []}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Missing or empty 'requests' field in batch request"
+            }
+        })
+    );
+    assert!(capture.bodies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn codex_responses_websocket_echoes_client_subprotocol() {
+    let ws_capture = WsCapture::default();
+    let openai = spawn_codex_ws_capture_upstream(ws_capture.clone()).await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let mut request = format!("ws://{proxy}/v1/responses")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("codex-realtime"),
+    );
+
+    let (mut socket, handshake) = connect_async(request).await.unwrap();
+    assert_eq!(
+        handshake
+            .headers()
+            .get("sec-websocket-protocol")
+            .expect("subprotocol echoed back to the client")
+            .to_str()
+            .unwrap(),
+        "codex-realtime"
+    );
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"type": "session.update"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = socket.next().await.unwrap().unwrap();
+
+    // The raw subprotocol header was forwarded upstream end-to-end.
+    let headers = ws_capture.headers.lock().unwrap();
+    assert_eq!(
+        headers[0].get("sec-websocket-protocol").unwrap(),
+        "codex-realtime"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_gauges_service_tier_and_terminal_status_surface_in_metrics() {
+    let openai = spawn_responses_sse_with_rate_limit_upstream().await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/responses"))
+        .json(&json!({"input": [], "stream": true}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("response.completed"));
+
+    // The SSE state machine runs off the byte path; poll briefly for
+    // its terminal-event metrics.
+    let mut metrics = String::new();
+    for _ in 0..50 {
+        metrics = reqwest::get(format!("http://{proxy}/metrics"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if metrics.contains("proxy_response_status_count_total{status=\"completed\"}") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        metrics.contains("proxy_rate_limit_remaining_requests{provider=\"openai_responses\"} 42")
+    );
+    assert!(
+        metrics.contains("proxy_rate_limit_remaining_tokens{provider=\"openai_responses\"} 9000")
+    );
+    assert!(metrics.contains("proxy_service_tier_count_total{tier=\"default\"}"));
+    assert!(metrics.contains("proxy_response_status_count_total{status=\"completed\"}"));
+    assert!(metrics.contains("hr_sse_inferred_cache_write_tokens"));
+}
+
+#[tokio::test]
+async fn sse_flood_passes_every_client_byte_even_if_parser_saturates() {
+    let (openai, expected) = spawn_sse_flood_upstream().await;
+    let anthropic = spawn_upstream(Capture::default()).await;
+    let proxy = spawn_proxy(openai, anthropic).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .json(&json!({"messages": [{"role": "user", "content": "flood"}]}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // Telemetry chunks may be dropped under parser saturation, but
+    // the client byte path must stay loss-free and byte-identical.
+    assert_eq!(text, expected);
 }
 
 async fn post_json(addr: SocketAddr, path: &str, body: Value) {
@@ -2091,6 +2618,9 @@ async fn spawn_codex_ws_capture_upstream(capture: WsCapture) -> SocketAddr {
                 let capture = capture.clone();
                 async move {
                     capture.headers.lock().unwrap().push(headers);
+                    // Accept the subprotocol Codex-style clients offer so
+                    // the proxy's upstream handshake succeeds.
+                    let ws = ws.protocols(["codex-realtime"]);
                     ws.on_upgrade(move |mut socket| async move {
                         while let Some(Ok(message)) = socket.next().await {
                             if let Message::Text(text) = message {
@@ -2765,6 +3295,168 @@ async fn spawn_sse_ccr_upstream() -> SocketAddr {
                 "\n",
             );
             ([("content-type", "text/event-stream")], body)
+        }),
+    );
+    spawn_app(app).await
+}
+
+/// Anthropic upstream whose responses confirm a large cached prefix.
+async fn spawn_anthropic_cached_usage_upstream(capture: Capture) -> SocketAddr {
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let capture = capture.clone();
+            move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    capture_request(&capture, request).await;
+                    Json(json!({
+                        "id": "msg_cached",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "z".repeat(3500)}],
+                        "stop_reason": "end_turn",
+                        "usage": {
+                            "input_tokens": 50,
+                            "output_tokens": 4,
+                            "cache_read_input_tokens": 1500,
+                            "cache_creation_input_tokens": 700
+                        }
+                    }))
+                }
+            }
+        }),
+    );
+    spawn_app(app).await
+}
+
+/// Responses SSE upstream emitting a terminal `response.completed`
+/// event with a service tier, plus rate-limit response headers.
+async fn spawn_responses_sse_with_rate_limit_upstream() -> SocketAddr {
+    let app = Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let body = concat!(
+                "event: response.in_progress\n",
+                "data: {\"type\":\"response.in_progress\",\"response\":{}}\n",
+                "\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"default\",",
+                "\"usage\":{\"input_tokens\":30,\"output_tokens\":6,",
+                "\"input_tokens_details\":{\"cached_tokens\":12}}}}\n",
+                "\n",
+                "data: [DONE]\n\n",
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("x-ratelimit-remaining-requests", "42")
+                .header("x-ratelimit-remaining-tokens", "9000")
+                .body(Body::from(body))
+                .unwrap()
+        }),
+    );
+    spawn_app(app).await
+}
+
+/// SSE upstream that floods the connection with far more chunks than
+/// the parser queue depth (256), exercising the try_send drop path.
+async fn spawn_sse_flood_upstream() -> (SocketAddr, String) {
+    let mut expected = String::new();
+    for index in 0..2000 {
+        expected.push_str(&format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk {index} 🦀\"}}}}],\"usage\":null}}\n\n"
+        ));
+    }
+    expected.push_str("data: [DONE]\n\n");
+
+    let body = expected.clone();
+    let app = Router::new().route(
+        "/{*path}",
+        post(move || {
+            let body = body.clone();
+            async move {
+                let chunks: Vec<Result<Bytes, Infallible>> = body
+                    .as_bytes()
+                    .chunks(64)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect();
+                let stream = futures_util::stream::iter(chunks);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+        }),
+    );
+    (spawn_app(app).await, expected)
+}
+
+/// Responses SSE upstream that captures request bodies and confirms a
+/// large cached prefix on the terminal event.
+async fn spawn_responses_cached_usage_upstream(capture: Capture) -> SocketAddr {
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let capture = capture.clone();
+            move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    capture_request(&capture, request).await;
+                    let body = concat!(
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+                        "{\"input_tokens\":3000,\"output_tokens\":5,",
+                        "\"input_tokens_details\":{\"cached_tokens\":2900}}}}\n",
+                        "\n",
+                        "data: [DONE]\n\n",
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }
+        }),
+    );
+    spawn_app(app).await
+}
+
+/// Responses upstream returning a buffered JSON (non-SSE) response
+/// that confirms a large cached prefix.
+async fn spawn_responses_json_cached_usage_upstream(capture: Capture) -> SocketAddr {
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let capture = capture.clone();
+            move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    capture_request(&capture, request).await;
+                    let body = json!({
+                        "id": "resp_cached",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 3000,
+                            "output_tokens": 5,
+                            "input_tokens_details": {"cached_tokens": 2900}
+                        }
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        // A header only this test emits for the
+                        // openai_responses provider, so the gauge
+                        // assertion cannot race other tests.
+                        .header("anthropic-ratelimit-input-tokens-remaining", "5150")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap()
+                }
+            }
         }),
     );
     spawn_app(app).await

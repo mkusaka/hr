@@ -90,7 +90,9 @@ upstream.
 Use `--compression false`, `--compression-mode off`, or
 `--compression-mode passthrough` to disable target request mutation. The
 `--compression-max-body-bytes` alias is accepted for the same limit as
-`--max-body-bytes`.
+`--max-body-bytes`. User-message text is protected by default; pass
+`--compress-user-messages` (or set `HEADROOM_COMPRESS_USER_MESSAGES=1`) to
+opt user text into compression as well.
 
 The forwarder strips hop-by-hop headers and proxy-internal `x-headroom-*`
 headers before sending upstream, preserves or creates `x-request-id`, and adds
@@ -111,10 +113,15 @@ Set `x-headroom-bypass: true` or `x-headroom-mode: passthrough` to skip
 compression for a target request while still stripping those internal headers
 before the upstream call.
 
-Compression mutates only live-zone user/tool/tool-result content of at least
-512 bytes. It does not modify system prompts, tool definitions, historical
-messages, reasoning blocks, thinking signatures, CCR retrieval outputs, or
-content blocks carrying cache-control metadata. When a request contains a CCR
+Compression mutates only live-zone tool/tool-result content of at least
+512 bytes. User, system, and assistant text is protected by default;
+user-message text becomes a candidate only with `--compress-user-messages`.
+Compression never modifies system prompts, tool definitions, historical
+messages, reasoning blocks, thinking signatures, CCR retrieval outputs,
+content blocks carrying cache-control metadata, or prefixes the provider has
+already confirmed as cached for the session (tracked from usage fields in
+JSON and SSE responses). Mutations are applied as byte-range splices: every
+byte outside the replaced spans is forwarded exactly as the client sent it. When a request contains a CCR
 marker or compression creates one, the proxy injects a `headroom_retrieve` tool
 definition in the provider's tool schema so the model can request the original
 content.
@@ -126,10 +133,13 @@ cache metadata mutation is skipped. Compressed Anthropic requests sort tools by
 name and add ephemeral `cache_control` to the last tool when no cache-control
 metadata is already present.
 
-SSE responses are streamed byte-for-byte while a non-blocking parser records
-usage and cache-read counters from OpenAI Chat/Responses and Anthropic event
-streams into `/stats` and `/metrics`. `headroom_retrieve` tool calls appearing
-in SSE streams are counted but left for the client to resolve.
+SSE responses are streamed byte-for-byte while a bounded, non-blocking parser
+tee records usage, cache-read and inferred cache-write counters, `service_tier`,
+terminal response status, and rate-limit header gauges from OpenAI
+Chat/Responses and Anthropic event streams into `/stats` and `/metrics`; a
+saturated parser drops telemetry, never client bytes. Confirmed cache usage
+also feeds the per-session frozen-prefix tracker. `headroom_retrieve` tool
+calls appearing in SSE streams are counted but left for the client to resolve.
 
 When a non-streaming JSON response from `/v1/messages` or
 `/v1/chat/completions` contains `headroom_retrieve` tool calls, the proxy
@@ -158,14 +168,16 @@ run separate instances for mutually untrusted clients.
 
 Current live-zone policy:
 
-- OpenAI Chat: skips `n > 1`, compresses the latest user message and latest
-  non-`headroom_retrieve` tool result.
+- OpenAI Chat: skips `n > 1`, compresses the latest non-`headroom_retrieve`
+  tool result; the latest user message is compressed only with
+  `--compress-user-messages`.
 - OpenAI Responses: compresses current-frame output items such as
   `function_call_output`, `local_shell_call_output`, and
   `apply_patch_call_output`, while preserving `headroom_retrieve` outputs,
   encrypted reasoning, compaction, computer, and unknown items.
-- Anthropic Messages: compresses the latest user message content and skips
-  thinking/cache-control blocks.
+- Anthropic Messages: compresses `tool_result` content and skips
+  thinking/cache-control blocks; user, system, and assistant text is
+  protected unless user text is opted in with `--compress-user-messages`.
 - Anthropic Message Batches: compresses each create request's
   `requests[].params.messages`; batch subpaths stream through unchanged.
 

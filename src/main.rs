@@ -55,6 +55,12 @@ enum Command {
         compression: bool,
         #[arg(long, default_value = "ccr")]
         compression_mode: String,
+        /// Opt in to compressing user-role message text. Off by
+        /// default: user content is typically the subject of the
+        /// request and part of the prefix-cache zone. Also settable
+        /// via HEADROOM_COMPRESS_USER_MESSAGES=1.
+        #[arg(long, default_value_t = false)]
+        compress_user_messages: bool,
     },
     Stats,
 }
@@ -103,11 +109,16 @@ async fn main() -> HrResult<()> {
             max_body_bytes,
             compression,
             compression_mode,
+            compress_user_messages,
         } => {
             init_tracing(&log_level)?;
             let openai_upstream = Url::parse(&openai_upstream)?;
             let anthropic_upstream = Url::parse(&anthropic_upstream)?;
             let compression_mode = CompressionMode::parse(&compression_mode)?;
+            let compress_user_text = compress_user_messages
+                || std::env::var("HEADROOM_COMPRESS_USER_MESSAGES")
+                    .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
             serve_proxy(ProxyConfig {
                 listen,
                 openai_upstream,
@@ -117,6 +128,7 @@ async fn main() -> HrResult<()> {
                 max_body_bytes,
                 compression_enabled: compression,
                 compression_mode,
+                compress_user_text,
             })
             .await?;
         }

@@ -29,6 +29,30 @@ pub(crate) struct Stats {
     ccr_continuation_retrievals: AtomicU64,
     ccr_stream_tool_calls: AtomicU64,
     ccr_batch_results_processed: AtomicU64,
+    sse_inferred_cache_write_tokens: AtomicU64,
+    service_tier_counts: Mutex<BTreeMap<String, u64>>,
+    response_status_counts: Mutex<BTreeMap<String, u64>>,
+    rate_limit_remaining: Mutex<BTreeMap<String, RateLimitSnapshot>>,
+}
+
+/// Upstream-reported rate-limit gauges extracted from response
+/// headers. `None` fields are headers the upstream did not include —
+/// they are not emitted (no fabricated values).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RateLimitSnapshot {
+    pub remaining_requests: Option<i64>,
+    pub remaining_tokens: Option<i64>,
+    pub remaining_input_tokens: Option<i64>,
+    pub remaining_output_tokens: Option<i64>,
+}
+
+impl RateLimitSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.remaining_requests.is_none()
+            && self.remaining_tokens.is_none()
+            && self.remaining_input_tokens.is_none()
+            && self.remaining_output_tokens.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -62,6 +86,10 @@ pub struct StatsSnapshot {
     pub ccr_continuation_retrievals: u64,
     pub ccr_stream_tool_calls: u64,
     pub ccr_batch_results_processed: u64,
+    pub sse_inferred_cache_write_tokens: u64,
+    pub service_tier_counts: BTreeMap<String, u64>,
+    pub response_status_counts: BTreeMap<String, u64>,
+    pub rate_limit_remaining: BTreeMap<String, RateLimitSnapshot>,
 }
 
 pub fn stats() -> StatsSnapshot {
@@ -191,6 +219,58 @@ pub(crate) fn record_ccr_batch_result_processed() {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Inferred OpenAI cache-write tokens (`max(input - cached, 0)`),
+/// mirroring `headroom/proxy/handlers/openai.py:334-344`.
+pub(crate) fn record_inferred_cache_write_tokens(tokens: u64) {
+    GLOBAL_STATS
+        .sse_inferred_cache_write_tokens
+        .fetch_add(tokens, Ordering::Relaxed);
+}
+
+/// `proxy_service_tier_count_total{tier}` — caller must validate the
+/// tier against the bounded vocabulary first.
+pub(crate) fn record_service_tier(tier: &'static str) {
+    let mut counts = GLOBAL_STATS
+        .service_tier_counts
+        .lock()
+        .expect("stats service_tier_counts lock poisoned");
+    *counts.entry(tier.to_string()).or_insert(0) += 1;
+}
+
+/// `proxy_response_status_count_total{status}` — bounded vocabulary.
+pub(crate) fn record_response_status(status: &'static str) {
+    let mut counts = GLOBAL_STATS
+        .response_status_counts
+        .lock()
+        .expect("stats response_status_counts lock poisoned");
+    *counts.entry(status.to_string()).or_insert(0) += 1;
+}
+
+/// `proxy_rate_limit_remaining_*{provider}` gauges. Only fields the
+/// upstream actually reported overwrite the previous value.
+pub(crate) fn record_rate_limit_snapshot(provider: &str, snapshot: RateLimitSnapshot) {
+    if snapshot.is_empty() {
+        return;
+    }
+    let mut gauges = GLOBAL_STATS
+        .rate_limit_remaining
+        .lock()
+        .expect("stats rate_limit_remaining lock poisoned");
+    let entry = gauges.entry(provider.to_string()).or_default();
+    if snapshot.remaining_requests.is_some() {
+        entry.remaining_requests = snapshot.remaining_requests;
+    }
+    if snapshot.remaining_tokens.is_some() {
+        entry.remaining_tokens = snapshot.remaining_tokens;
+    }
+    if snapshot.remaining_input_tokens.is_some() {
+        entry.remaining_input_tokens = snapshot.remaining_input_tokens;
+    }
+    if snapshot.remaining_output_tokens.is_some() {
+        entry.remaining_output_tokens = snapshot.remaining_output_tokens;
+    }
+}
+
 pub(crate) fn record_sse_cache_hit_rate(provider: &str, rate: f64) {
     if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
         return;
@@ -203,6 +283,13 @@ pub(crate) fn record_sse_cache_hit_rate(provider: &str, rate: f64) {
     let entry = rates.entry(provider.to_string()).or_default();
     entry.count += 1;
     entry.sum += rate;
+}
+
+/// Serializes tests that reset or assert the process-global stats.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -251,6 +338,24 @@ pub(crate) fn reset_for_tests() {
     GLOBAL_STATS
         .ccr_batch_results_processed
         .store(0, Ordering::Relaxed);
+    GLOBAL_STATS
+        .sse_inferred_cache_write_tokens
+        .store(0, Ordering::Relaxed);
+    GLOBAL_STATS
+        .service_tier_counts
+        .lock()
+        .expect("stats service_tier_counts lock poisoned")
+        .clear();
+    GLOBAL_STATS
+        .response_status_counts
+        .lock()
+        .expect("stats response_status_counts lock poisoned")
+        .clear();
+    GLOBAL_STATS
+        .rate_limit_remaining
+        .lock()
+        .expect("stats rate_limit_remaining lock poisoned")
+        .clear();
 }
 
 impl Stats {
@@ -297,6 +402,24 @@ impl Stats {
             ccr_continuation_retrievals: self.ccr_continuation_retrievals.load(Ordering::Relaxed),
             ccr_stream_tool_calls: self.ccr_stream_tool_calls.load(Ordering::Relaxed),
             ccr_batch_results_processed: self.ccr_batch_results_processed.load(Ordering::Relaxed),
+            sse_inferred_cache_write_tokens: self
+                .sse_inferred_cache_write_tokens
+                .load(Ordering::Relaxed),
+            service_tier_counts: self
+                .service_tier_counts
+                .lock()
+                .expect("stats service_tier_counts lock poisoned")
+                .clone(),
+            response_status_counts: self
+                .response_status_counts
+                .lock()
+                .expect("stats response_status_counts lock poisoned")
+                .clone(),
+            rate_limit_remaining: self
+                .rate_limit_remaining
+                .lock()
+                .expect("stats rate_limit_remaining lock poisoned")
+                .clone(),
         }
     }
 }

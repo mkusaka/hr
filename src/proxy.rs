@@ -1,6 +1,12 @@
 use crate::ccr::{CcrStore, SqliteStore, HASH_HEX_LEN};
 use crate::compression::{
-    compress_json_request_with_auth, ApiShape, RequestAuthMode, RequestCompression,
+    compress_json_request_ctx, compress_json_request_with_auth, ApiShape, CompressContext,
+    RequestAuthMode, RequestCompression,
+};
+use crate::session::{estimate_message_tokens, SessionProvider, SessionTrackers};
+use crate::sse::{
+    extract_rate_limit_snapshot, run_sse_state_machine, usage_u64, usage_u64_opt, SseKind,
+    SseSessionCtx, SSE_PARSER_QUEUE_DEPTH,
 };
 use crate::stats;
 use crate::{error, HrResult};
@@ -65,6 +71,10 @@ pub struct ProxyConfig {
     pub max_body_bytes: usize,
     pub compression_enabled: bool,
     pub compression_mode: CompressionMode,
+    /// Opt-in user-text compression
+    /// (`--compress-user-messages` / `HEADROOM_COMPRESS_USER_MESSAGES=1`,
+    /// mirroring `headroom/proxy/models.py` `compress_user_messages`).
+    pub compress_user_text: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +86,9 @@ pub struct ProxyState {
     max_body_bytes: usize,
     compression_enabled: bool,
     compression_mode: CompressionMode,
+    compress_user_text: bool,
     batch_contexts: Arc<Mutex<BatchContexts>>,
+    sessions: SessionTrackers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -161,7 +173,8 @@ pub async fn serve_proxy(config: ProxyConfig) -> HrResult<()> {
     )
     .with_max_body_bytes(config.max_body_bytes)
     .with_compression_enabled(config.compression_enabled)
-    .with_compression_mode(config.compression_mode);
+    .with_compression_mode(config.compression_mode)
+    .with_compress_user_text(config.compress_user_text);
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
 
@@ -266,7 +279,9 @@ impl ProxyState {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             compression_enabled: true,
             compression_mode: CompressionMode::Ccr,
+            compress_user_text: false,
             batch_contexts: Arc::new(Mutex::new(VecDeque::new())),
+            sessions: SessionTrackers::new(),
         }
     }
 
@@ -282,6 +297,11 @@ impl ProxyState {
 
     pub fn with_compression_mode(mut self, compression_mode: CompressionMode) -> Self {
         self.compression_mode = compression_mode;
+        self
+    }
+
+    pub fn with_compress_user_text(mut self, compress_user_text: bool) -> Self {
+        self.compress_user_text = compress_user_text;
         self
     }
 
@@ -483,6 +503,8 @@ hr_ccr_continuation_retrievals {}
 hr_ccr_stream_tool_calls {}
 # TYPE hr_ccr_batch_results_processed counter
 hr_ccr_batch_results_processed {}
+# TYPE hr_sse_inferred_cache_write_tokens counter
+hr_sse_inferred_cache_write_tokens {}
 ",
         snapshot.total_requests,
         snapshot.compressed_requests,
@@ -504,6 +526,7 @@ hr_ccr_batch_results_processed {}
         snapshot.ccr_continuation_retrievals,
         snapshot.ccr_stream_tool_calls,
         snapshot.ccr_batch_results_processed,
+        snapshot.sse_inferred_cache_write_tokens,
     );
     let skipped_by_reason = snapshot
         .skipped_requests
@@ -524,7 +547,52 @@ proxy_cache_hit_rate_per_session_sum{{provider=\"{provider}\"}} {}\n",
             )
         })
         .collect::<String>();
-    let body = format!("{body}{skipped_by_reason}{cache_hit_rates}");
+    // Metric names mirror the reference
+    // (`observability/metric_names.rs`): bounded `tier` / `status`
+    // label vocabularies, per-provider rate-limit gauges.
+    let service_tiers = snapshot
+        .service_tier_counts
+        .iter()
+        .map(|(tier, count)| format!("proxy_service_tier_count_total{{tier=\"{tier}\"}} {count}\n"))
+        .collect::<String>();
+    let response_statuses = snapshot
+        .response_status_counts
+        .iter()
+        .map(|(status, count)| {
+            format!("proxy_response_status_count_total{{status=\"{status}\"}} {count}\n")
+        })
+        .collect::<String>();
+    let rate_limits = snapshot
+        .rate_limit_remaining
+        .iter()
+        .map(|(provider, gauges)| {
+            let mut lines = String::new();
+            if let Some(value) = gauges.remaining_requests {
+                lines.push_str(&format!(
+                    "proxy_rate_limit_remaining_requests{{provider=\"{provider}\"}} {value}\n"
+                ));
+            }
+            if let Some(value) = gauges.remaining_tokens {
+                lines.push_str(&format!(
+                    "proxy_rate_limit_remaining_tokens{{provider=\"{provider}\"}} {value}\n"
+                ));
+            }
+            if let Some(value) = gauges.remaining_input_tokens {
+                lines.push_str(&format!(
+                    "proxy_rate_limit_remaining_input_tokens{{provider=\"{provider}\"}} {value}\n"
+                ));
+            }
+            if let Some(value) = gauges.remaining_output_tokens {
+                lines.push_str(&format!(
+                    "proxy_rate_limit_remaining_output_tokens{{provider=\"{provider}\"}} {value}\n"
+                ));
+            }
+            lines
+        })
+        .collect::<String>();
+    let body = format!(
+        "{body}{skipped_by_reason}{cache_hit_rates}{service_tiers}{response_statuses}{rate_limits}"
+    );
 
     Response::builder()
         .status(StatusCode::OK)
@@ -904,6 +972,17 @@ async fn proxy_get_handler(
     if let Ok(upgrade) = ws {
         stats::record_request();
         let headers = req.headers().clone();
+        // Subprotocol negotiation: accept the client connection with
+        // its first requested subprotocol so strict clients (Codex)
+        // see it echoed; the raw `sec-websocket-protocol` header is
+        // forwarded upstream by `copy_websocket_headers`. Mirrors
+        // `headroom/proxy/handlers/openai.py:3341-3354`.
+        let client_protocols = websocket_client_protocols(&headers);
+        let upgrade = if client_protocols.is_empty() {
+            upgrade
+        } else {
+            upgrade.protocols(client_protocols)
+        };
         return upgrade
             .on_upgrade(move |socket| {
                 proxy_websocket(
@@ -967,6 +1046,7 @@ async fn proxy_http(
                 headers,
                 req.into_body(),
                 upstream_url,
+                uri.path(),
                 client_addr,
             )
             .await
@@ -984,6 +1064,7 @@ async fn proxy_http(
                 headers,
                 req.into_body(),
                 upstream_url,
+                uri.path(),
                 client_addr,
             )
             .await
@@ -1001,6 +1082,7 @@ async fn proxy_http(
                 headers,
                 req.into_body(),
                 upstream_url,
+                uri.path(),
                 client_addr,
             )
             .await
@@ -1028,6 +1110,7 @@ async fn proxy_http(
                     state,
                     headers,
                     upstream_url,
+                    uri.path(),
                     client_addr,
                     contexts,
                 )
@@ -1045,6 +1128,7 @@ async fn proxy_http(
             headers,
             req.into_body(),
             upstream_url,
+            uri.path(),
             client_addr,
         )
         .await
@@ -1063,8 +1147,94 @@ async fn buffer_and_forward_known_json(
     client_addr: Option<SocketAddr>,
 ) -> HrResult<Response<Body>> {
     let method = req.method().clone();
-    let headers = req.headers().clone();
+    let mut headers = req.headers().clone();
+    // Telemetry keys off the CLIENT path: the upstream URL may carry a
+    // configured base-path prefix that would break exact matching.
+    let request_path = req.uri().path().to_string();
     let body = read_limited_body(req, state.max_body_bytes).await?;
+    let parsed_request: Option<Value> = serde_json::from_slice(&body).ok();
+
+    // Empty-batch validation, mirroring `anthropic.py:2458-2469`: a
+    // missing or empty `requests` field is rejected with 400 before
+    // anything is forwarded upstream.
+    if target == CompressionTarget::AnthropicMessageBatches {
+        if let Some(parsed) = &parsed_request {
+            let requests_missing_or_empty = match parsed.get("requests") {
+                None | Some(Value::Null) => true,
+                Some(Value::Array(requests)) => requests.is_empty(),
+                Some(_) => false,
+            };
+            if requests_missing_or_empty {
+                stats::record_skipped_request("empty_batch");
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "Missing or empty 'requests' field in batch request",
+                        }
+                    }),
+                ));
+            }
+        }
+    }
+
+    // Session identity + provider-confirmed frozen floor for the
+    // surfaces the reference tracks (`anthropic.py:885-892`,
+    // `openai.py:1531-1576`).
+    let session_provider = match target {
+        CompressionTarget::AnthropicMessages => Some(SessionProvider::Anthropic),
+        CompressionTarget::OpenAiChatCompletions | CompressionTarget::OpenAiResponses => {
+            Some(SessionProvider::OpenAi)
+        }
+        CompressionTarget::AnthropicMessageBatches => None,
+    };
+    let session_id = session_provider.and_then(|provider| {
+        parsed_request.as_ref().map(|parsed| {
+            // The Responses surface has its own session shaping
+            // (string `instructions` only); chat/Anthropic walk the
+            // body's `messages`.
+            let id = if target == CompressionTarget::OpenAiResponses {
+                SessionTrackers::compute_responses_session_id(&headers, parsed)
+            } else {
+                SessionTrackers::compute_session_id(&headers, parsed)
+            };
+            (provider, id)
+        })
+    });
+    let frozen_message_count = session_id
+        .as_ref()
+        .map(|(provider, id)| state.sessions.frozen_message_count(*provider, id))
+        .unwrap_or(0);
+
+    // Session-sticky beta-header merge: betas seen earlier in a
+    // session are merged into later requests, case-insensitively
+    // deduped, first-seen order. The reference applies this to
+    // `anthropic-beta` on /v1/messages (`anthropic.py:895-938`) and to
+    // `openai-beta` on the chat and Responses HTTP paths
+    // (`openai.py:1535-1574`).
+    let beta_header_name = match target {
+        CompressionTarget::AnthropicMessages => Some("anthropic-beta"),
+        CompressionTarget::OpenAiChatCompletions | CompressionTarget::OpenAiResponses => {
+            Some("openai-beta")
+        }
+        CompressionTarget::AnthropicMessageBatches => None,
+    };
+    if let (Some(header_name), Some((provider, id))) = (beta_header_name, &session_id) {
+        let client_value = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let merged = state
+            .sessions
+            .sticky_betas(*provider, id, client_value.as_deref());
+        if !merged.is_empty() && Some(merged.as_str()) != client_value.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(&merged) {
+                headers.insert(HeaderName::from_static(header_name), value);
+            }
+        }
+    }
 
     let shape = match target {
         CompressionTarget::OpenAiChatCompletions => ApiShape::OpenAiChatCompletions,
@@ -1072,10 +1242,49 @@ async fn buffer_and_forward_known_json(
         CompressionTarget::AnthropicMessages => ApiShape::AnthropicMessages,
         CompressionTarget::AnthropicMessageBatches => ApiShape::AnthropicMessageBatches,
     };
-    let mut mutation =
-        compress_json_request_with_auth(&body, shape, &state.store, classify_auth_mode(&headers));
+    let mut mutation = compress_json_request_ctx(
+        &body,
+        shape,
+        CompressContext {
+            store: &state.store,
+            auth_mode: classify_auth_mode(&headers),
+            frozen_message_count,
+            compress_user_text: state.compress_user_text,
+            provider_metadata: true,
+        },
+    );
     record_mutation_stats(&mutation);
     let body_to_forward = std::mem::take(&mut mutation.body);
+
+    // Session context handed to the response side so provider-confirmed
+    // cache usage feeds the tracker. Token estimates come from the
+    // forwarded (post-compression) messages, mirroring the reference's
+    // `next_forwarded_messages` (`anthropic.py:2216-2228`).
+    let session = session_id.map(|(provider, id)| {
+        let message_token_estimates = serde_json::from_slice::<Value>(&body_to_forward)
+            .ok()
+            .map(|forwarded| {
+                // Route by surface, not body shape: a Responses body
+                // carrying a legacy `messages` alias still holds
+                // Responses ITEMS, which the chat estimator would
+                // misread (missing `function_call_output.output`).
+                if target == CompressionTarget::OpenAiResponses {
+                    return crate::session::estimate_responses_request_tokens(&forwarded);
+                }
+                forwarded
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .map(|messages| estimate_message_tokens(messages))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        SseSessionCtx {
+            trackers: state.sessions.clone(),
+            provider,
+            session_id: id,
+            message_token_estimates,
+        }
+    });
 
     let mut response = match target {
         CompressionTarget::AnthropicMessages => {
@@ -1085,8 +1294,10 @@ async fn buffer_and_forward_known_json(
                 &headers,
                 body_to_forward,
                 upstream_url,
+                &request_path,
                 client_addr,
                 CcrProvider::Anthropic,
+                session,
             )
             .await?
         }
@@ -1097,8 +1308,10 @@ async fn buffer_and_forward_known_json(
                 &headers,
                 body_to_forward,
                 upstream_url,
+                &request_path,
                 client_addr,
                 CcrProvider::OpenAi,
+                session,
             )
             .await?
         }
@@ -1109,6 +1322,7 @@ async fn buffer_and_forward_known_json(
                 &headers,
                 body_to_forward,
                 upstream_url,
+                &request_path,
                 client_addr,
             )
             .await?
@@ -1120,7 +1334,9 @@ async fn buffer_and_forward_known_json(
                 headers,
                 body_to_forward,
                 upstream_url,
+                &request_path,
                 client_addr,
+                session,
             )
             .await?
         }
@@ -1149,14 +1365,17 @@ impl CcrProvider {
 /// and continues the conversation upstream until the response has no CCR tool
 /// calls left (or the round limit is hit). Mirrors the reference proxy's
 /// non-streaming CCR response handling.
+#[allow(clippy::too_many_arguments)]
 async fn forward_with_ccr_continuation(
     state: &ProxyState,
     method: Method,
     headers: &HeaderMap,
     body: Vec<u8>,
     upstream_url: Url,
+    request_path: &str,
     client_addr: Option<SocketAddr>,
     provider: CcrProvider,
+    session: Option<SseSessionCtx>,
 ) -> HrResult<Response<Body>> {
     let request_id = ensure_request_id(headers);
     let request_body: Option<Value> = serde_json::from_slice(&body).ok();
@@ -1173,14 +1392,15 @@ async fn forward_with_ccr_continuation(
     );
 
     let Some(request_body) = request_body else {
-        return response_to_axum(response, &request_id, upstream_url.path());
+        return response_to_axum(response, &request_id, request_path, session);
     };
     if !ccr_response_buffer_eligible(&response) {
-        return response_to_axum(response, &request_id, upstream_url.path());
+        return response_to_axum(response, &request_id, request_path, session);
     }
 
     let status = response.status();
     let response_headers = response.headers().clone();
+    record_rate_limit_headers(&response_headers, request_path);
     let bytes = response.bytes().await?;
     let Ok(initial) = serde_json::from_slice::<Value>(&bytes) else {
         return buffered_response_to_axum(
@@ -1192,6 +1412,7 @@ async fn forward_with_ccr_continuation(
         );
     };
     if extract_ccr_tool_calls(&initial, provider).is_empty() {
+        update_session_from_json_response(&session, &initial, provider);
         return buffered_response_to_axum(
             status,
             &response_headers,
@@ -1211,6 +1432,7 @@ async fn forward_with_ccr_continuation(
         provider,
     )
     .await;
+    update_session_from_json_response(&session, &final_response, provider);
     if !changed {
         // No continuation round succeeded — return the upstream bytes
         // untouched so the client can resolve the tool call itself.
@@ -1550,12 +1772,14 @@ fn extract_assistant_message(response: &Value, provider: CcrProvider) -> Value {
 
 /// Forwards an Anthropic batch create and records per-request context from
 /// the compressed body so CCR tool calls in batch results can be continued.
+#[allow(clippy::too_many_arguments)]
 async fn forward_batch_create(
     state: &ProxyState,
     method: Method,
     headers: &HeaderMap,
     body: Vec<u8>,
     upstream_url: Url,
+    request_path: &str,
     client_addr: Option<SocketAddr>,
 ) -> HrResult<Response<Body>> {
     let request_id = ensure_request_id(headers);
@@ -1573,7 +1797,7 @@ async fn forward_batch_create(
     );
 
     if !ccr_response_buffer_eligible(&response) {
-        return response_to_axum(response, &request_id, upstream_url.path());
+        return response_to_axum(response, &request_id, request_path, None);
     }
 
     let status = response.status();
@@ -1614,6 +1838,7 @@ async fn forward_batch_results(
     state: ProxyState,
     headers: HeaderMap,
     upstream_url: Url,
+    request_path: &str,
     client_addr: Option<SocketAddr>,
     contexts: HashMap<String, Value>,
 ) -> HrResult<Response<Body>> {
@@ -1628,7 +1853,7 @@ async fn forward_batch_results(
     );
 
     if response.status() != StatusCode::OK || response.headers().get("content-encoding").is_some() {
-        return response_to_axum(response, &request_id, upstream_url.path());
+        return response_to_axum(response, &request_id, request_path, None);
     }
 
     let status = response.status();
@@ -1816,13 +2041,16 @@ fn record_mutation_stats(mutation: &RequestCompression) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_buffered(
     state: ProxyState,
     method: Method,
     headers: HeaderMap,
     body: Vec<u8>,
     upstream_url: Url,
+    request_path: &str,
     client_addr: Option<SocketAddr>,
+    session: Option<SseSessionCtx>,
 ) -> HrResult<Response<Body>> {
     let request_id = ensure_request_id(&headers);
     let mut builder = state
@@ -1836,7 +2064,28 @@ async fn forward_buffered(
         status = %response.status(),
         "request forwarded"
     );
-    response_to_axum(response, &request_id, upstream_url.path())
+
+    // Buffered JSON responses feed the session prefix tracker, like
+    // the reference Responses HTTP path (`openai.py:2318-2341` /
+    // `3159-3176`): a non-streaming response confirming cached tokens
+    // must advance the frozen floor for the next turn.
+    if session.is_some() && ccr_response_buffer_eligible(&response) {
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        record_rate_limit_headers(&response_headers, request_path);
+        let bytes = response.bytes().await?;
+        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+            update_session_from_json_response(&session, &value, CcrProvider::OpenAi);
+        }
+        return buffered_response_to_axum(
+            status,
+            &response_headers,
+            bytes.to_vec(),
+            &request_id,
+            false,
+        );
+    }
+    response_to_axum(response, &request_id, request_path, session)
 }
 
 async fn forward_streaming(
@@ -1845,6 +2094,7 @@ async fn forward_streaming(
     headers: HeaderMap,
     body: Body,
     upstream_url: Url,
+    request_path: &str,
     client_addr: Option<SocketAddr>,
 ) -> HrResult<Response<Body>> {
     let request_id = ensure_request_id(&headers);
@@ -1860,7 +2110,7 @@ async fn forward_streaming(
         status = %response.status(),
         "request forwarded"
     );
-    response_to_axum(response, &request_id, upstream_url.path())
+    response_to_axum(response, &request_id, request_path, None)
 }
 
 fn apply_headers(
@@ -1901,10 +2151,12 @@ fn response_to_axum(
     response: reqwest::Response,
     request_id: &str,
     request_path: &str,
+    session: Option<SseSessionCtx>,
 ) -> HrResult<Response<Body>> {
     let status = response.status();
     let headers = response.headers().clone();
     let upstream_request_id = upstream_request_id(&headers);
+    record_rate_limit_headers(&headers, request_path);
     let sse_kind = sse_stream_kind(&headers, request_path);
     let mut builder = Response::builder().status(status);
     let connection_listed = connection_listed_headers(&headers);
@@ -1928,11 +2180,24 @@ fn response_to_axum(
     let stream = response.bytes_stream();
     let body = if let Some(kind) = sse_kind {
         stats::record_sse_stream();
-        Body::from_stream(stream.scan(SseTelemetry::new(kind), |state, chunk| {
+        // Tee each chunk into a bounded mpsc so the spawned
+        // state-machine task can update telemetry without holding up
+        // the client. `try_send` never blocks: if the parser falls
+        // behind, the telemetry chunk is dropped and the client byte
+        // path is unaffected (mirrors `headroom-proxy/src/proxy.rs`
+        // PR-C1 contract).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(SSE_PARSER_QUEUE_DEPTH);
+        tokio::spawn(run_sse_state_machine(kind, rx, session));
+        Body::from_stream(stream.map(move |chunk| {
             if let Ok(bytes) = &chunk {
-                state.observe(bytes);
+                if let Err(err) = tx.try_send(bytes.clone()) {
+                    debug!(
+                        error = %err,
+                        "sse parser queue full or closed; skipping telemetry chunk"
+                    );
+                }
             }
-            std::future::ready(Some(chunk))
+            chunk
         }))
     } else {
         Body::from_stream(stream)
@@ -1958,13 +2223,6 @@ fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SseKind {
-    OpenAiChat,
-    OpenAiResponses,
-    Anthropic,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSocketKind {
     CodexResponses,
@@ -1972,6 +2230,9 @@ enum WebSocketKind {
 }
 
 const OPENAI_RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+/// First-frame wait bound for Codex Responses WebSocket connections
+/// (`headroom/proxy/handlers/openai.py:331`).
+const WS_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn sse_stream_kind(headers: &HeaderMap, request_path: &str) -> Option<SseKind> {
     let is_sse = headers
@@ -2004,260 +2265,85 @@ fn sse_stream_kind(headers: &HeaderMap, request_path: &str) -> Option<SseKind> {
     }
 }
 
-#[derive(Debug)]
-struct SseTelemetry {
-    kind: SseKind,
-    buffer: Vec<u8>,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
-    emitted: bool,
-}
-
-impl SseTelemetry {
-    fn new(kind: SseKind) -> Self {
-        Self {
-            kind,
-            buffer: Vec::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            emitted: false,
-        }
-    }
-
-    fn observe(&mut self, bytes: &Bytes) {
-        self.buffer.extend_from_slice(bytes);
-        while let Some(end) = sse_event_end(&self.buffer) {
-            let event = self.buffer.drain(..end).collect::<Vec<_>>();
-            while self
-                .buffer
-                .first()
-                .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-            {
-                self.buffer.remove(0);
+/// Feed provider-confirmed cache usage from a buffered JSON response
+/// into the session prefix tracker, mirroring `anthropic.py:2195-2228`
+/// (Anthropic `cache_read/creation_input_tokens`) and
+/// `openai.py:2094-2116` (OpenAI `prompt_tokens_details.cached_tokens`
+/// with the inferred cache write from `openai.py:334-344`).
+fn update_session_from_json_response(
+    session: &Option<SseSessionCtx>,
+    response: &Value,
+    provider: CcrProvider,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let Some(usage) = response.get("usage").filter(|usage| usage.is_object()) else {
+        return;
+    };
+    let mut estimates = session.message_token_estimates.clone();
+    let (cache_read, cache_write) = match provider {
+        CcrProvider::Anthropic => {
+            // The reference appends the assistant message from the
+            // response before walking the estimates
+            // (`anthropic.py:2216-2228`).
+            if let Some(content) = response.get("content") {
+                let assistant = json!({"role": "assistant", "content": content.clone()});
+                estimates.extend(estimate_message_tokens(std::slice::from_ref(&assistant)));
             }
-            self.observe_event(&event);
+            (
+                usage_u64(usage, &["cache_read_input_tokens"]),
+                usage_u64(usage, &["cache_creation_input_tokens"]),
+            )
         }
-
-        const MAX_BUFFER: usize = 1024 * 1024;
-        if self.buffer.len() > MAX_BUFFER {
-            let keep = self.buffer.split_off(self.buffer.len() - MAX_BUFFER / 2);
-            self.buffer = keep;
+        CcrProvider::OpenAi => {
+            let cache_read = usage
+                .get("prompt_tokens_details")
+                .or_else(|| usage.get("input_tokens_details"))
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| usage_u64_opt(usage, &["cache_read_input_tokens"]))
+                .unwrap_or(0);
+            let creation = usage_u64(usage, &["cache_creation_input_tokens"]);
+            let write = if creation > 0 {
+                creation
+            } else {
+                let input = usage_u64(usage, &["prompt_tokens", "input_tokens"]);
+                input.saturating_sub(cache_read)
+            };
+            (cache_read, write)
         }
-    }
-
-    fn observe_event(&mut self, event: &[u8]) {
-        let Ok(text) = std::str::from_utf8(event) else {
-            return;
-        };
-        let event_type = text
-            .lines()
-            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("event:"))
-            .map(str::trim)
-            .find(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        let data = text
-            .lines()
-            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-            .map(str::trim_start)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if data.trim().is_empty() || data.trim() == "[DONE]" {
-            return;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&data) else {
-            return;
-        };
-
-        // Streaming CCR parity with the reference proxy: retrieval tool
-        // calls in SSE responses are resolved by the client, but the proxy
-        // still records them for observability.
-        if ccr_stream_tool_call_detected(self.kind, &value) {
-            stats::record_ccr_stream_tool_call();
-            info!(
-                provider = ?self.kind,
-                "ccr retrieval tool call detected in SSE stream (client-resolved)"
-            );
-        }
-
-        match self.kind {
-            SseKind::OpenAiChat => {
-                if let Some(usage) = value.get("usage") {
-                    self.absorb_usage(usage);
-                    self.emit_final("openai");
-                }
-            }
-            SseKind::OpenAiResponses => {
-                let kind = value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .or(event_type.as_deref());
-                if matches!(
-                    kind,
-                    Some("response.completed" | "response.failed" | "response.incomplete")
-                ) {
-                    if let Some(usage) = value.get("usage").or_else(|| {
-                        value
-                            .get("response")
-                            .and_then(|response| response.get("usage"))
-                    }) {
-                        self.absorb_usage(usage);
-                    }
-                    self.emit_final("openai");
-                }
-            }
-            SseKind::Anthropic => {
-                let kind = value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .or(event_type.as_deref());
-                match kind {
-                    Some("message_start") => {
-                        if let Some(usage) = value
-                            .get("message")
-                            .and_then(|message| message.get("usage"))
-                            .or_else(|| value.get("usage"))
-                        {
-                            self.absorb_usage(usage);
-                        }
-                    }
-                    Some("message_delta") => {
-                        if let Some(usage) = value.get("usage") {
-                            self.absorb_usage(usage);
-                        }
-                    }
-                    Some("message_stop") => self.emit_final("anthropic"),
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    fn absorb_usage(&mut self, usage: &Value) {
-        let input = usage_u64(usage, &["prompt_tokens", "input_tokens"]);
-        let output = usage_u64(usage, &["completion_tokens", "output_tokens"]);
-        let details = usage
-            .get("prompt_tokens_details")
-            .or_else(|| usage.get("input_tokens_details"));
-        let cache_read = details
-            .and_then(|details| usage_u64_opt(details, &["cached_tokens"]))
-            .or_else(|| usage_u64_opt(usage, &["cache_read_input_tokens"]))
-            .unwrap_or_default();
-        let cache_creation = usage_u64(usage, &["cache_creation_input_tokens"]);
-
-        self.input_tokens = self.input_tokens.max(input);
-        self.output_tokens = self.output_tokens.max(output);
-        self.cache_read_input_tokens = self.cache_read_input_tokens.max(cache_read);
-        self.cache_creation_input_tokens = self.cache_creation_input_tokens.max(cache_creation);
-    }
-
-    fn emit_final(&mut self, provider: &str) {
-        if self.emitted {
-            return;
-        }
-        self.emitted = true;
-        if self.input_tokens == 0
-            && self.output_tokens == 0
-            && self.cache_read_input_tokens == 0
-            && self.cache_creation_input_tokens == 0
-        {
-            return;
-        }
-
-        stats::record_sse_usage(
-            self.input_tokens,
-            self.output_tokens,
-            self.cache_read_input_tokens,
-            self.cache_creation_input_tokens,
-        );
-
-        let denominator = match self.kind {
-            SseKind::Anthropic => self
-                .input_tokens
-                .saturating_add(self.cache_read_input_tokens)
-                .saturating_add(self.cache_creation_input_tokens),
-            SseKind::OpenAiChat | SseKind::OpenAiResponses => self.input_tokens,
-        };
-        if denominator > 0 && self.cache_read_input_tokens <= denominator {
-            stats::record_sse_cache_hit_rate(
-                provider,
-                self.cache_read_input_tokens as f64 / denominator as f64,
-            );
-        }
-    }
+    };
+    session.trackers.update_from_response(
+        session.provider,
+        &session.session_id,
+        cache_read,
+        cache_write,
+        &estimates,
+    );
 }
 
-/// Detects a `headroom_retrieve` tool call inside an SSE event without
-/// mutating the stream.
-fn ccr_stream_tool_call_detected(kind: SseKind, value: &Value) -> bool {
-    match kind {
-        SseKind::Anthropic => {
-            value.get("type").and_then(Value::as_str) == Some("content_block_start")
-                && value.get("content_block").is_some_and(|block| {
-                    block.get("type").and_then(Value::as_str) == Some("tool_use")
-                        && block
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .is_some_and(is_retrieve_tool_name)
-                })
-        }
-        SseKind::OpenAiChat => {
-            value
-                .get("choices")
-                .and_then(Value::as_array)
-                .is_some_and(|choices| {
-                    choices.iter().any(|choice| {
-                        choice
-                            .get("delta")
-                            .and_then(|delta| delta.get("tool_calls"))
-                            .and_then(Value::as_array)
-                            .is_some_and(|calls| {
-                                calls.iter().any(|call| {
-                                    call.get("function")
-                                        .and_then(|function| function.get("name"))
-                                        .and_then(Value::as_str)
-                                        .is_some_and(is_retrieve_tool_name)
-                                })
-                            })
-                    })
-                })
-        }
-        SseKind::OpenAiResponses => {
-            value.get("type").and_then(Value::as_str) == Some("response.output_item.added")
-                && value.get("item").is_some_and(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("function_call")
-                        && item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .is_some_and(is_retrieve_tool_name)
-                })
-        }
-    }
-}
-
-fn sse_event_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| index + 2)
-        .or_else(|| {
-            buffer
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|index| index + 4)
-        })
-}
-
-fn usage_u64(value: &Value, keys: &[&str]) -> u64 {
-    usage_u64_opt(value, keys).unwrap_or_default()
-}
-
-fn usage_u64_opt(value: &Value, keys: &[&str]) -> Option<u64> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+/// Record upstream rate-limit gauges keyed by the provider label the
+/// reference uses (`anthropic` / `openai_chat` / `openai_responses`),
+/// derived from the request path. Mirrors
+/// `headroom-proxy/src/proxy.rs:972-1013`.
+fn record_rate_limit_headers(headers: &HeaderMap, request_path: &str) {
+    let provider = if request_path == "/v1/messages" || request_path.starts_with("/v1/messages/") {
+        "anthropic"
+    } else if request_path == "/v1/chat/completions" {
+        "openai_chat"
+    } else if matches!(
+        request_path,
+        "/v1/responses"
+            | "/v1/codex/responses"
+            | "/backend-api/responses"
+            | "/backend-api/codex/responses"
+    ) {
+        "openai_responses"
+    } else {
+        return;
+    };
+    stats::record_rate_limit_snapshot(provider, extract_rate_limit_snapshot(headers));
 }
 
 fn apply_compression_response_headers(headers: &mut HeaderMap, mutation: &RequestCompression) {
@@ -2357,6 +2443,7 @@ fn classify_auth_mode(headers: &HeaderMap) -> RequestAuthMode {
         "claude-vscode/",
         "github-copilot/",
         "anthropic-cli/",
+        "antigravity/",
     ]
     .iter()
     .any(|prefix| user_agent.contains(prefix))
@@ -2592,13 +2679,48 @@ async fn proxy_codex_responses_websocket(
     mut client_socket: WebSocket,
     state: ProxyState,
     uri: Uri,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     client_addr: Option<SocketAddr>,
 ) -> HrResult<()> {
-    let Some(first_message) = client_socket.next().await else {
-        return Ok(());
-    };
-    let first_message = first_message?;
+    // First-frame timeout, mirroring the reference WS handler
+    // (`openai.py:331` `WS_FIRST_FRAME_TIMEOUT_SECONDS = 60`,
+    // `openai.py:3579` close code 1001): a connection that never sends
+    // a frame cannot hold a WS slot open indefinitely.
+    let first_message =
+        match tokio::time::timeout(WS_FIRST_FRAME_TIMEOUT, client_socket.next()).await {
+            Ok(Some(message)) => message?,
+            Ok(None) => return Ok(()),
+            Err(_elapsed) => {
+                let _ = client_socket
+                    .send(AxumWsMessage::Close(Some(CloseFrame {
+                        code: 1001,
+                        reason: "first frame timeout".into(),
+                    })))
+                    .await;
+                return Ok(());
+            }
+        };
+
+    // Per-connection session-sticky `openai-beta` merge, mirroring
+    // `openai.py:3496-3518` (the WS handler records the client value
+    // under a per-connection session id, then layers the required
+    // websockets beta on top).
+    let connection_session = generate_request_id();
+    let client_beta = headers
+        .get("openai-beta")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let merged_beta = state.sessions.sticky_betas(
+        SessionProvider::OpenAi,
+        &connection_session,
+        client_beta.as_deref(),
+    );
+    if !merged_beta.is_empty() && Some(merged_beta.as_str()) != client_beta.as_deref() {
+        if let Ok(value) = HeaderValue::from_str(&merged_beta) {
+            headers.insert(HeaderName::from_static("openai-beta"), value);
+        }
+    }
+
     let Some((first_message, first_text_for_fallback)) =
         prepare_client_codex_ws_message(first_message, &state, &headers)
     else {
@@ -2652,7 +2774,7 @@ async fn proxy_codex_responses_websocket(
     };
 
     let upstream_to_client = async move {
-        let mut telemetry = OpenAiResponsesWsTelemetry::default();
+        let mut telemetry = OpenAiResponsesWsTelemetry;
         while let Some(message) = upstream_rx.next().await {
             let message = message?;
             let (frame_kind, frame_bytes) = tungstenite_ws_frame_summary(&message);
@@ -2676,6 +2798,22 @@ async fn proxy_codex_responses_websocket(
         result = client_to_upstream => result,
         result = upstream_to_client => result,
     }
+}
+
+/// The client's requested WebSocket subprotocols, in offer order.
+fn websocket_client_protocols(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|protocol| !protocol.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn websocket_kind(path: &str, provider: UpstreamProvider) -> WebSocketKind {
@@ -2747,14 +2885,27 @@ fn maybe_compress_codex_response_create_frame(
         return raw_text.to_string();
     };
 
-    let mut mutation = compress_json_request_with_auth(
+    // WS `response.create` frames mirror the reference payload
+    // compressor (`openai.py:1212`, `1749-1770`): live-zone
+    // compression and CCR retrieve-tool injection only — no tool
+    // sort, no cache_control placement, no `prompt_cache_key`.
+    let mut mutation = compress_json_request_ctx(
         &body,
         ApiShape::OpenAiResponses,
-        &state.store,
-        classify_auth_mode(headers),
+        CompressContext {
+            store: &state.store,
+            auth_mode: classify_auth_mode(headers),
+            frozen_message_count: 0,
+            compress_user_text: state.compress_user_text,
+            provider_metadata: false,
+        },
     );
     record_mutation_stats(&mutation);
-    if !mutation.compressed {
+    // Forward the rewrite whenever the bytes changed: a frame whose
+    // only mutation is the metadata-only retrieve-tool injection
+    // (existing `<<ccr:...>>` markers, nothing newly compressed) must
+    // still reach upstream with the tool available.
+    if mutation.body == body {
         return raw_text.to_string();
     }
 
@@ -2813,13 +2964,13 @@ async fn codex_ws_http_fallback(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        // Error frame shape mirrors the reference fallback
+        // (`headroom/proxy/handlers/openai.py:5540-5549`).
         let error_frame = json!({
-            "type": "response.failed",
+            "type": "error",
             "error": {
-                "type": "upstream_error",
-                "status": status.as_u16(),
-                "message": text,
+                "type": "server_error",
+                "message": format!("Upstream returned {}", status.as_u16()),
             }
         });
         client_socket
@@ -2858,7 +3009,7 @@ async fn relay_sse_response_over_websocket(
     response: reqwest::Response,
     mut client_socket: WebSocket,
 ) -> HrResult<()> {
-    let mut telemetry = OpenAiResponsesWsTelemetry::default();
+    let mut telemetry = OpenAiResponsesWsTelemetry;
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::<u8>::new();
 
@@ -2888,77 +3039,74 @@ async fn relay_sse_response_over_websocket(
     Ok(())
 }
 
+/// Usage telemetry for the Codex Responses WebSocket path. Only
+/// `response.completed` events carry usage
+/// (`headroom/proxy/handlers/openai.py:347-378`, `_extract_responses_usage`
+/// returns zeros for every other event type); one connection can
+/// complete several responses, each recorded as it lands
+/// (`openai.py:4865-4870`). The OpenAI cache-write inference from
+/// `openai.py:334-344` applies per completed response.
 #[derive(Debug, Default)]
-struct OpenAiResponsesWsTelemetry {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
-}
+struct OpenAiResponsesWsTelemetry;
 
 impl OpenAiResponsesWsTelemetry {
     fn observe_text(&mut self, text: &str) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
-        let kind = value.get("type").and_then(Value::as_str);
-        if !matches!(
-            kind,
-            Some("response.completed" | "response.failed" | "response.incomplete")
-        ) {
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let status = match kind {
+            "response.completed" => crate::sse::response_status::COMPLETED,
+            "response.failed" => crate::sse::response_status::FAILED,
+            "response.incomplete" => crate::sse::response_status::INCOMPLETE,
+            _ => return,
+        };
+        // Terminal-status and service-tier telemetry mirror the
+        // reference WS metrics hook (`openai.py:4625` /
+        // `_record_ws_response_metrics`, fired on
+        // `response.completed|failed|incomplete`).
+        stats::record_response_status(status);
+        if let Some(tier) = value
+            .get("response")
+            .and_then(|response| response.get("service_tier"))
+            .or_else(|| value.get("service_tier"))
+            .and_then(Value::as_str)
+        {
+            stats::record_service_tier(crate::sse::service_tier::validate(tier));
+        }
+        if kind != "response.completed" {
             return;
         }
-        if let Some(usage) = value.get("usage").or_else(|| {
-            value
-                .get("response")
-                .and_then(|response| response.get("usage"))
-        }) {
-            self.absorb_usage(usage);
-        }
-        self.emit_final();
-    }
+        let Some(usage) = value
+            .get("usage")
+            .or_else(|| {
+                value
+                    .get("response")
+                    .and_then(|response| response.get("usage"))
+            })
+            .filter(|usage| usage.is_object())
+        else {
+            return;
+        };
 
-    fn absorb_usage(&mut self, usage: &Value) {
-        let input = usage_u64(usage, &["prompt_tokens", "input_tokens"]);
-        let output = usage_u64(usage, &["completion_tokens", "output_tokens"]);
+        let input = usage_u64(usage, &["input_tokens", "prompt_tokens"]);
+        let output = usage_u64(usage, &["output_tokens", "completion_tokens"]);
         let details = usage
-            .get("prompt_tokens_details")
-            .or_else(|| usage.get("input_tokens_details"));
+            .get("input_tokens_details")
+            .or_else(|| usage.get("prompt_tokens_details"));
         let cache_read = details
             .and_then(|details| usage_u64_opt(details, &["cached_tokens"]))
             .or_else(|| usage_u64_opt(usage, &["cache_read_input_tokens"]))
             .unwrap_or_default();
-        let cache_creation = usage_u64(usage, &["cache_creation_input_tokens"]);
-
-        self.input_tokens = self.input_tokens.max(input);
-        self.output_tokens = self.output_tokens.max(output);
-        self.cache_read_input_tokens = self.cache_read_input_tokens.max(cache_read);
-        self.cache_creation_input_tokens = self.cache_creation_input_tokens.max(cache_creation);
-    }
-
-    fn emit_final(&mut self) {
-        if self.input_tokens == 0
-            && self.output_tokens == 0
-            && self.cache_read_input_tokens == 0
-            && self.cache_creation_input_tokens == 0
-        {
+        if input == 0 && output == 0 && cache_read == 0 {
             return;
         }
 
-        stats::record_sse_usage(
-            self.input_tokens,
-            self.output_tokens,
-            self.cache_read_input_tokens,
-            self.cache_creation_input_tokens,
-        );
-        if self.input_tokens > 0 && self.cache_read_input_tokens <= self.input_tokens {
-            stats::record_sse_cache_hit_rate(
-                "openai",
-                self.cache_read_input_tokens as f64 / self.input_tokens as f64,
-            );
+        stats::record_sse_usage(input, output, cache_read, 0);
+        stats::record_inferred_cache_write_tokens(input.saturating_sub(cache_read));
+        if input > 0 && cache_read <= input {
+            stats::record_sse_cache_hit_rate("openai_responses", cache_read as f64 / input as f64);
         }
-
-        *self = Self::default();
     }
 }
 
@@ -3215,59 +3363,6 @@ mod tests {
         );
         assert_eq!(CompressionMode::parse("off").unwrap(), CompressionMode::Off);
         assert!(CompressionMode::parse("unknown").is_err());
-    }
-
-    #[test]
-    fn detects_ccr_stream_tool_calls_per_provider() {
-        assert!(ccr_stream_tool_call_detected(
-            SseKind::Anthropic,
-            &json!({
-                "type": "content_block_start",
-                "content_block": {"type": "tool_use", "name": "headroom_retrieve"}
-            })
-        ));
-        assert!(!ccr_stream_tool_call_detected(
-            SseKind::Anthropic,
-            &json!({
-                "type": "content_block_start",
-                "content_block": {"type": "tool_use", "name": "other_tool"}
-            })
-        ));
-        assert!(!ccr_stream_tool_call_detected(
-            SseKind::Anthropic,
-            &json!({
-                "type": "content_block_start",
-                "content_block": {"type": "text", "text": "headroom_retrieve"}
-            })
-        ));
-        assert!(ccr_stream_tool_call_detected(
-            SseKind::OpenAiChat,
-            &json!({
-                "choices": [{
-                    "delta": {
-                        "tool_calls": [{"index": 0, "function": {"name": "headroom_retrieve"}}]
-                    }
-                }]
-            })
-        ));
-        assert!(!ccr_stream_tool_call_detected(
-            SseKind::OpenAiChat,
-            &json!({"choices": [{"delta": {"content": "headroom_retrieve"}}]})
-        ));
-        assert!(ccr_stream_tool_call_detected(
-            SseKind::OpenAiResponses,
-            &json!({
-                "type": "response.output_item.added",
-                "item": {"type": "function_call", "name": "mcp__headroom_retrieve"}
-            })
-        ));
-        assert!(!ccr_stream_tool_call_detected(
-            SseKind::OpenAiResponses,
-            &json!({
-                "type": "response.output_item.added",
-                "item": {"type": "reasoning"}
-            })
-        ));
     }
 
     #[test]
@@ -3553,62 +3648,5 @@ mod tests {
             anthropic_batch_results_batch_id(&Method::GET, "/v1/messages/batches//results"),
             None
         );
-    }
-
-    #[test]
-    fn sse_state_machines_gate_usage_and_cache_hit_rate() {
-        stats::reset_for_tests();
-
-        let mut responses = SseTelemetry::new(SseKind::OpenAiResponses);
-        responses.observe(&Bytes::from_static(
-            br#"event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":"hello"}
-
-"#,
-        ));
-        assert_eq!(stats::stats().sse_input_tokens, 0);
-        responses.observe(&Bytes::from_static(
-            br#"event: response.completed
-data: {"type":"response.completed","response":{"usage":{"input_tokens":20,"output_tokens":5,"input_tokens_details":{"cached_tokens":8}}}}
-
-"#,
-        ));
-        let snapshot = stats::stats();
-        assert_eq!(snapshot.sse_input_tokens, 20);
-        assert_eq!(snapshot.sse_output_tokens, 5);
-        assert_eq!(snapshot.sse_cache_read_input_tokens, 8);
-        let openai = snapshot.sse_cache_hit_rates.get("openai").unwrap();
-        assert_eq!(openai.count, 1);
-        assert!((openai.sum - 0.4).abs() < f64::EPSILON);
-
-        stats::reset_for_tests();
-        let mut anthropic = SseTelemetry::new(SseKind::Anthropic);
-        anthropic.observe(&Bytes::from_static(
-            br#"event: message_start
-data: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":25,"cache_creation_input_tokens":5}}}
-
-"#,
-        ));
-        anthropic.observe(&Bytes::from_static(
-            br#"event: message_delta
-data: {"type":"message_delta","usage":{"output_tokens":9}}
-
-"#,
-        ));
-        assert_eq!(stats::stats().sse_input_tokens, 0);
-        anthropic.observe(&Bytes::from_static(
-            br#"event: message_stop
-data: {"type":"message_stop"}
-
-"#,
-        ));
-        let snapshot = stats::stats();
-        assert_eq!(snapshot.sse_input_tokens, 100);
-        assert_eq!(snapshot.sse_output_tokens, 9);
-        assert_eq!(snapshot.sse_cache_read_input_tokens, 25);
-        assert_eq!(snapshot.sse_cache_creation_input_tokens, 5);
-        let anthropic = snapshot.sse_cache_hit_rates.get("anthropic").unwrap();
-        assert_eq!(anthropic.count, 1);
-        assert!((anthropic.sum - (25.0 / 130.0)).abs() < f64::EPSILON);
     }
 }
