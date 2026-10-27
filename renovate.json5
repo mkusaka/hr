@@ -1,0 +1,59 @@
+{
+  automerge: true,
+  platformAutomerge: false,
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  minimumReleaseAge: "7 days",
+  extends: ["config:best-practices"],
+  customManagers: [
+    {
+      customType: "regex",
+      managerFilePatterns: [
+        "/(^|/)(workflow-templates|\\.(?:github|gitea|forgejo)/(?:workflows|actions))/.+\\.ya?ml$/",
+        "/(^|/)action\\.ya?ml$/",
+      ],
+      matchStrings: [
+        "# renovate: datasource=(?<datasource>[a-zA-Z0-9-._]+?) depName=(?<depName>[^\\s]+?)(?: (?:lookupName|packageName)=(?<packageName>[^\\s]+?))?(?: versioning=(?<versioning>[^\\s]+?))?(?: extractVersion=(?<extractVersion>[^\\s]+?))?(?: registryUrl=(?<registryUrl>[^\\s]+?))?\\s+[A-Za-z0-9_]+?_VERSION\\s*:\\s*[\"']?(?<currentValue>.+?)[\"']?\\s",
+      ],
+    },
+  ],
+  packageRules: [
+    {
+      matchManagers: ["cargo"],
+      matchDepTypes: [
+        "dependencies",
+        "build-dependencies",
+        "workspace.dependencies",
+      ],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "cargo non-major runtime dependencies",
+      automerge: true,
+      automergeType: "pr",
+      minimumReleaseAge: "7 days",
+    },
+    {
+      matchManagers: ["cargo"],
+      matchDepTypes: ["dev-dependencies"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "cargo non-major development dependencies",
+      automerge: true,
+      automergeType: "pr",
+      minimumReleaseAge: "7 days",
+    },
+    {
+      matchManagers: ["github-actions"],
+      matchUpdateTypes: ["minor", "patch", "digest", "pinDigest"],
+      groupName: "github-actions non-major updates",
+      automerge: true,
+      automergeType: "pr",
+      minimumReleaseAge: "7 days",
+    },
+    {
+      matchManagers: ["custom.regex"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "workflow tool versions",
+      automerge: true,
+      automergeType: "pr",
+      minimumReleaseAge: "7 days",
+    },
+  ],
+}
